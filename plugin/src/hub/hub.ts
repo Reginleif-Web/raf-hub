@@ -48,7 +48,7 @@ import { accountOf, SessionStore, topicName } from "./sessions.ts";
 import { isThreadNotFound, TelegramError } from "./telegram.ts";
 import { media, richPhotos, richToMarkdown } from "./rich.ts";
 import { withContext } from "./reply-context.ts";
-import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, parsePollPress, POLL_PREFIX, questionButtons, questionText, withOutcome } from "./questions.ts";
+import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, dialogWarning, parsePollPress, POLL_PREFIX, questionButtons, questionText, SESSION_RESTARTING_REASON, withOutcome } from "./questions.ts";
 import { richPieces } from "./rich-out.ts";
 import { DEFAULT_VIDEO_TOOLS, probeVideo, thumbPath } from "./video.ts";
 import { EXEC_CARD_MS, EXEC_CHECK_MS, EXEC_MAX_AGE_MS, Execs } from "./exec.ts";
@@ -127,6 +127,10 @@ const CATCH_UP_MS = 1000;
 // Sent batches whose ✍ is cleared with their first message; the oldest are
 // forgotten past this.
 const MAX_BATCH_IDS = 200;
+// Tool call ids remembered per session (the taken calls, the warned dialogs); the oldest are forgotten past
+// this, except the ids of open polls. The same bound as for the other remembered ids: a call is looked up
+// while its result is missing from the transcript, which is only the latest calls of a session.
+const MAX_CALL_IDS = MAX_BATCH_IDS;
 // Telegram shows "typing…" for up to 5 s; it is renewed this often while the
 // agent works.
 const TYPING_EVERY_MS = 4000;
@@ -642,7 +646,13 @@ export class Hub {
       }
       const { messagingSocket, session_id: hookSession, tool_input, tool_use_id } = r.data;
       const sessionId = this.questionSession(messagingSocket, hookSession);
-      if (!this.store.get(sessionId)?.enabled || this.isStarting(sessionId)) return Response.json({ decision: "none" });
+      if (!this.store.get(sessionId)?.enabled) return Response.json({ decision: "none" });
+      // The session is being stopped or restarted and no window can take the poll. With the mode on the owner
+      // reads Telegram, so the agent is denied, not left to a dialog nobody sees.
+      if (this.isStarting(sessionId)) {
+        this.takeCall(sessionId, tool_use_id);
+        return Response.json({ decision: "deny", reason: SESSION_RESTARTING_REASON } satisfies QuestionDecision);
+      }
       // The answer may take hours; the hook's own timeout bounds the wait.
       server.timeout(req, 0);
       const decision = this.askQuestion(sessionId, tool_input.questions, req.signal, tool_use_id);
@@ -725,18 +735,23 @@ export class Hub {
     this.idleExpired = false;
   }
 
+  // A window left the session (it closed, or moved on to another session). Without any window the session
+  // cannot take an answer any more: its polls end with a request to ask again, and what the hub kept of its
+  // dialogs goes. Called after the window is no longer counted as the session's.
+  private releaseSession(sid: string): void {
+    if (this.connOf(sid)) return;
+    this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+    this.taken.delete(sid);
+    this.anonymousAsk.delete(sid);
+    this.warnedDialogs.delete(sid);
+  }
+
   private onClose(ws: WS): void {
     this.conns.delete(ws);
     const sid = ws.data.sessionId;
     if (!this.running) return;
     if (sid) this.log.info(`window for session ${sid} disconnected`);
-    // Without its window the session cannot take an answer any more.
-    if (sid && !this.connOf(sid)) {
-      this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
-      this.taken.delete(sid);
-      this.anonymousAsk.delete(sid);
-      this.warnedDialogs.delete(sid);
-    }
+    if (sid) this.releaseSession(sid);
     // The window a stop or a cleanup ended is gone: what was held meanwhile goes the way a new topic message would.
     const closing = [...this.launches].filter(([launchSid, l]) => l.ending?.closing && this.endingSettled(launchSid, l.old));
     for (const [launchSid, l] of closing) this.finishEnding(launchSid, l);
@@ -1029,7 +1044,10 @@ ${msg.text}`);
     const entrypoint = msg.entrypoint ?? ws.data.entrypoint;
     const transcript = this.transcriptOf(msg.sessionId);
     const attachedOffset = transcript ? statSync(transcript).size : undefined;
+    const left = ws.data.sessionId;
     ws.data = { ...ws.data, sessionId: msg.sessionId, cwd: msg.cwd, account, configDir: msg.configDir ?? ws.data.configDir, entrypoint, attachedOffset, launchedMode: undefined };
+    // A window that moves on is gone from the session it left, as if it had disconnected; a resume of the same session is no move.
+    if (left && left !== msg.sessionId) this.releaseSession(left);
     this.applyDefaultMode({ sessionId: msg.sessionId, cwd: msg.cwd, entrypoint, title: msg.title });
     this.store.setWhere(msg.sessionId, msg.cwd, account);
     const title = msg.title;
@@ -1151,9 +1169,22 @@ ${msg.text}`);
       this.anonymousAsk.add(sessionId);
       return;
     }
-    const ids = this.taken.get(sessionId) ?? new Set<string>();
+    this.rememberCall(this.taken, sessionId, toolUseId);
+  }
+
+  // Adds a call id to the session's set in `calls`, newest last. Past MAX_CALL_IDS the oldest ids go, but never
+  // the id of an open poll of the session, which must stay taken until its poll ends.
+  private rememberCall(calls: Map<string, Set<string>>, sessionId: string, toolUseId: string): void {
+    const ids = calls.get(sessionId) ?? new Set<string>();
+    ids.delete(toolUseId);
     ids.add(toolUseId);
-    this.taken.set(sessionId, ids);
+    calls.set(sessionId, ids);
+    if (ids.size <= MAX_CALL_IDS) return;
+    const open = new Set(this.pollsOf(sessionId).map(p => p.toolUseId));
+    for (const old of ids) {
+      if (ids.size <= MAX_CALL_IDS) break;
+      if (!open.has(old)) ids.delete(old);
+    }
   }
 
   // A window reported an AskUserQuestion call that has no result in the transcript. When the hub did not
@@ -1167,13 +1198,11 @@ ${msg.text}`);
     const sid = ws.data.sessionId;
     if (!sid || ws.data.entrypoint !== CLI_ENTRYPOINT || !this.store.get(sid)?.enabled) return;
     if (this.taken.get(sid)?.has(toolUseId) || this.anonymousAsk.has(sid) || this.pollsOf(sid).length > 0) return;
-    const warned = this.warnedDialogs.get(sid) ?? new Set<string>();
-    if (warned.has(toolUseId)) return;
+    if (this.warnedDialogs.get(sid)?.has(toolUseId)) return;
     // Before the awaited check below, so a second report of the call meanwhile finds it warned.
-    warned.add(toolUseId);
-    this.warnedDialogs.set(sid, warned);
+    this.rememberCall(this.warnedDialogs, sid, toolUseId);
     if (this.terminals && (await this.terminals.running(sid))) return;
-    this.notice(sid, this.m().dialogWaiting({ questions }), "warning");
+    this.notice(sid, dialogWarning(this.m(), questions), "warning");
   }
 
   // The polls of a session in the order they came; the first is the shown one.
@@ -1290,8 +1319,8 @@ ${msg.text}`);
     }
     if (action === "cancel") {
       this.log.info(`question poll ${p.key} cancelled by ${press.fromId}`);
-      // Cancelling the question ends the session's waiting polls too: they are the same unanswered turn.
-      const done = this.endPolls(p.sessionId, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled).settled;
+      // The button ends the shown poll only, and the next waiting one is then shown; the "!" message ends them all.
+      const done = this.finishPoll(p, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled);
       await ack();
       await done;
       return;
@@ -2453,7 +2482,11 @@ ${msg.text}`);
   // to the terminal and are not swallowed), batches queued or waiting and an open replay give their
   // messages up, so none reaches a window that is about to end.
   private capturePending(sessionId: string): void {
-    for (const p of this.endPolls(sessionId, { decision: "none" }, this.m().pollMovedToTerminal).polls) this.spawn(this.takeAnswer(p.key));
+    // With the mode on the owner reads Telegram, so the polls are denied and no dialog opens; with it off they go to the terminal.
+    const [decision, outcome]: [QuestionDecision, string] = this.store.get(sessionId)?.enabled
+      ? [{ decision: "deny", reason: SESSION_RESTARTING_REASON }, this.m().pollSessionRestarting]
+      : [{ decision: "none" }, this.m().pollMovedToTerminal];
+    for (const p of this.endPolls(sessionId, decision, outcome).polls) this.spawn(this.takeAnswer(p.key));
     for (const entry of this.batchItems.get(sessionId) ?? []) {
       entry.captured = true;
       for (const message of entry.messages) this.hold(sessionId, { message });

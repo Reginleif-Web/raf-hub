@@ -84,10 +84,10 @@ close the poll; `/stop` ends the session, and its poll becomes outdated.
 
 **Cancel.** "✖️ Cancel" closes the poll: the hook answers `permissionDecision: "deny"` with the reason
 "The user cancelled the question in Telegram. Do not ask it again; end your turn and wait for their
-message." The agent ends the turn. Polls of the same session that wait behind it are closed the same way: the owner
-cancelled the questions of that step, not one call.
+message." The agent ends the turn. The button ends only the poll that is shown; a poll of the same session that waits
+behind it is then shown the same way as after an answer.
 
-**A message with "!" while a poll is open.** It closes the polls of the session the same way as cancel, and the message itself
+**A message with "!" while a poll is open.** It closes all the polls of the session, the shown one and those waiting, the same way as cancel, and the message itself
 goes to the agent as an ordinary incoming message: without "!" and without an interrupt (the agent is waiting for the answer, there is nothing to interrupt, and
 an interrupt would break the turn that starts with the denial). A lone "!" only closes the poll and sends the agent
 nothing.
@@ -127,23 +127,32 @@ that does not know the header reads the body unchanged. A hub that refuses or ha
 `none` without the header. Aborting the request after the headers still reaches the hub (`req.signal`) and ends the
 poll with none and "ended on the terminal side".
 
-**After acceptance the hook never ends silently by accident.** If the hook saw the header, then every technical end
-that follows is a refusal with an English reason: the connection dropped, the hub was killed, the body is not a
-valid decision, or the hook's own time limit ran out. The reason says: the hub took the question, nothing
-was answered, nothing was asked in the terminal, and if the answer is still needed, ask again with a single
-`AskUserQuestion` call (`src/hook/question-reasons.ts`). An explicit `none` from the hub stays silent (the dialog
-opens in the terminal). When the parent process is gone nothing reads the output, so the hook exits silently.
+**One rule for every technical end.** A technical end is any end of the wait that the hub did not decide: the hub
+cannot be reached, the connection dropped or closed before the headers, the answer has an error status, the body is not
+a valid decision, or the hook's own time limit ran out. One function in the hook (`technicalEnd`, `src/hook/question.ts`)
+decides all of them, in this order:
+
+1. The parent process is gone: silent, nothing reads the output.
+2. The hub accepted the poll (the header was seen) and the end is anything but "unreachable": a refusal with an English
+   reason. It says: the hub took the question, nothing was answered, nothing was asked in the terminal, and if the answer
+   is still needed, ask again with a single `AskUserQuestion` call (`src/hook/question-reasons.ts`).
+3. Otherwise the persisted Telegram mode of the session is read (`readSessionMode`, read-only): on, a refusal (the hub
+   is unreachable, write the question as plain text and end the turn, or the ended reason of step 2); off, unknown or the
+   file unreadable, silent, the dialog opens in the terminal.
+
+An explicit `none` from the hub stays silent (the dialog opens in the terminal). So with the mode on the hook never
+falls through to the terminal dialog except when nobody reads its output.
 
 **Mixed versions.** A new hook with a hub that sends no header (an older hub) never saw an acceptance, so it behaves
 as before: every technical end is silent. An old hook with a new hub parses the body as JSON as before.
 
-**Hub unreachable.** If the request fails before any response (connection refused, or the connection closed before
-the headers) or the answer has an error status, the hook reads the persisted Telegram mode of the session read-only (`readSessionMode`, the
-`sessions.json` of the state directory; it never writes, never renames a corrupt file). Mode on: refusal with the
-reason that the hub is unreachable and the agent should write the question as plain text in its reply and end its
-turn, with no retry loop (a repeated `AskUserQuestion` would hit the same dead hub). Mode off, session unknown, or
-the file unreadable: silent, the dialog opens in the terminal. A deadline or a gone parent before any response is
-silent.
+**Hub unreachable.** The request fails before any response (connection refused, or the connection closed before the
+headers) or the answer has an error status. The persisted mode is the `sessions.json` of the state directory; the hook
+never writes it and never renames a corrupt file. Mode on: refusal with the reason that the hub is unreachable and the
+agent should write the question as plain text in its reply and end its turn, with no retry loop (a repeated
+`AskUserQuestion` would hit the same dead hub). Mode off, session unknown, or the file unreadable: silent, the dialog
+opens in the terminal. The hook's own time limit before any response (an older hub held the request) takes the ended
+reason of the rule above; a gone parent is silent.
 
 **Session.** The hub finds the session by the window with this `messagingSocket`, otherwise by `session_id`. Mode off
 or no session: none. The hub removes its idle timeout from the request and keeps it open until the poll
@@ -177,9 +186,13 @@ outlive the hub's knowledge of it.
 | Mode off at the request, or turned off while open | none (owner chose the terminal) | moved to the terminal |
 | Esc, window closed (request aborted) | none, for that poll only (the hook is gone and prints nothing) | ended on the terminal side, /terminal or answer there if the agent still waits |
 | The hook's own time limit after acceptance | deny, ask again (printed by the hook); the request is aborted, so the hub sees the same end as above | same |
-| Session being started (`isStarting`) at the request | none, no acceptance header (the session ends and the dialog goes with it) | nothing |
-| Session stopped or cleaned up while open (`capturePending`) | none (the session ends and the dialog goes with it) | moved to the terminal |
-| Cancel button or "!" | deny, cancelled (all polls of the session) | poll cancelled |
+| Session being started (`isStarting`) or being stopped at the request, mode off | none, no acceptance header (the session ends and the dialog goes with it) | nothing |
+| Session being started or being stopped at the request, mode on | deny, the session is being stopped or restarted, do not ask again now (`SESSION_RESTARTING_REASON`), no acceptance header | nothing |
+| Session stopped or cleaned up while open (`capturePending`), mode off | none (the session ends and the dialog goes with it) | moved to the terminal |
+| Session stopped or cleaned up while open (`capturePending`), mode on | deny, the session is being stopped or restarted, do not ask again now | closed because the session is being stopped or restarted |
+| "✖️ Cancel" button | deny, cancelled (the shown poll only; the next waiting poll is shown) | poll cancelled |
+| A message with "!" | deny, cancelled (all polls of the session) | poll cancelled |
+| The window moves to another session and no other window holds this one | deny, ask again (`windowGone`), all polls of the session; the dialog state of the session is released | closed, agent asked to ask again |
 | Hub stops gracefully | deny, ask again (`hubStopping`), all polls | closed, agent asked to ask again |
 | The window of the session is gone, or a button is pressed with no connected window | deny, ask again (`windowGone`) | same |
 | Telegram did not accept the poll message | deny, ask again (`notShown`); the next poll is shown | same |
@@ -220,6 +233,18 @@ The notice quotes the question texts, says that the session waits on a dialog in
 behind it, and that it must be answered on the PC (a session started with `/run` has `/terminal`). One notice per
 call, kept until the session's last window closes. The window reads only what the tailer already has, at the moment
 of the message; nothing polls.
+
+The notice is always one Telegram message within `MAX_MESSAGE` (`dialogWarning`, `src/hub/questions.ts`): each
+question is cut to 300 characters by code points (an emoji is never split), and questions that no longer fit are
+replaced by one last line, "…and N more" (`dialogMore`), that counts them.
+
+**Bounds and release of the dialog state.** The set of calls the hub took (`taken`) and the set of calls already warned
+about (`warnedDialogs`) hold the newest 200 call ids per session (the same number as the ids of one batch). Beyond
+that the oldest ids go, but never the id of a poll that is still open. The state of a session (its polls, `taken`,
+`anonymousAsk`, `warnedDialogs`) is released by one function in two cases: the last window of the session closes, and a
+window moves to another session while no other window holds the first (all polls of the first end with the
+`windowGone` refusal, as for a close). A resume of the same session id ends nothing, and neither does a window whose
+session another window still holds.
 
 Gaps, none of them a false notice: a dialog not yet flushed to the transcript at that moment is missed until the next
 message; the owner may answer on the PC between the check and the notice; a notice is not repeated for a call, even if

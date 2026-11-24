@@ -501,18 +501,75 @@ describe("AskUserQuestion hook", () => {
     }, PARENT_GONE_TEST_MS);
   });
 
-  // An old hub sends no acceptance header: the hook must act as it always did.
+  // An old hub sends no acceptance header. While the session's Telegram mode is on, the owner may be away, so a
+  // lost answer is a deny that tells the agent to ask again; with the mode off or unknown the hook stays silent.
   describe("with a hub that does not announce acceptance", () => {
-    test("a broken answer, none and a held request until the limit stay silent, even with the mode on", async () => {
-      const state = stateWithMode(true);
-      for (const decision of [{ decision: "none" }, { decision: "allow" }]) {
-        const { port } = await fakeHub(decision);
-        expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: state })).toEqual({ status: 0, stdout: "" });
-        server?.stop(true);
-      }
-      const { port } = await holdingHub();
-      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: state, TELEGRAM_HUB_QUESTION_DEADLINE_MS: String(TEST_DEADLINE_MS) })).toEqual({ status: 0, stdout: "" });
+    test("an explicit none stays silent, even with the mode on", async () => {
+      const { port } = await fakeHub({ decision: "none" });
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).toEqual({ status: 0, stdout: "" });
     });
+
+    test("a broken answer denies with the ask-again reason when the mode is on, and stays silent otherwise", async () => {
+      const { port } = await fakeHub({ decision: "allow" });
+      expectAskAgain(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
+      expect(await runQuestion(port, INPUT)).toEqual({ status: 0, stdout: "" });
+    });
+
+    test("a request held until the hook's limit denies with the ask-again reason when the mode is on, and stays silent otherwise", async () => {
+      const { port } = await holdingHub();
+      const limit = { TELEGRAM_HUB_QUESTION_DEADLINE_MS: String(TEST_DEADLINE_MS) };
+      expectAskAgain(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true), ...limit })).stdout));
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false), ...limit })).toEqual({ status: 0, stdout: "" });
+      expect(await runQuestion(port, INPUT, limit)).toEqual({ status: 0, stdout: "" });
+    });
+
+    test("a response cut off before its body ends denies with the ask-again reason when the mode is on", async () => {
+      const port = await freePort();
+      // Raw HTTP: the headers (no acceptance header) and one chunk go out, then the socket closes mid-body.
+      const listener = Bun.listen({
+        hostname: "127.0.0.1",
+        port,
+        socket: {
+          data(socket) {
+            socket.write("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n1\r\n \r\n");
+            socket.end();
+          },
+          open() {},
+          close() {},
+          error() {},
+        },
+      });
+      try {
+        expectAskAgain(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
+        expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
+      } finally {
+        listener.stop(true);
+      }
+    });
+
+    test("the parent gone is silent even with the mode on", async () => {
+      const { port, seen } = await holdingHub();
+      const out = join(tempDir(), "hook-stdout.txt");
+      const parent = Bun.spawn([process.execPath, "-e", PARENT_SCRIPT_TO_FILE], {
+        stdin: new Blob([JSON.stringify(INPUT)]),
+        stdout: "pipe",
+        env: { ...process.env, TELEGRAM_HUB_STATE_DIR: stateWithMode(true), TELEGRAM_HUB_PORT: String(port), HOOK_PATH: QUESTION_HOOK, OUT_PATH: out },
+        windowsHide: true,
+      });
+      const reader = parent.stdout.getReader();
+      const hookPid = Number(new TextDecoder().decode((await reader.read()).value).trim());
+      try {
+        await waitFor(() => seen.got === 1);
+        parent.kill();
+        await parent.exited;
+        await waitFor(() => seen.aborted === 1, PARENT_GONE_WAIT_MS);
+        await waitFor(() => !isAlive(hookPid), PARENT_GONE_WAIT_MS);
+        expect(readFileSync(out, "utf8")).toBe("");
+      } finally {
+        if (isAlive(hookPid)) process.kill(hookPid);
+      }
+    }, PARENT_GONE_TEST_MS);
 
     test("an answer from an old hub is read as before", async () => {
       const { port } = await fakeHub({ decision: "deny", reason: "cancelled" });

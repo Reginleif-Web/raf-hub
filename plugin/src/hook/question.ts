@@ -2,19 +2,21 @@
 // PreToolUse hook for AskUserQuestion: while Telegram mode is on, the hub asks
 // the questions in the topic and holds the request until they are answered.
 //
-// The hub marks a request it took as a poll with a header that goes out at
-// once (QUESTION_ACCEPTED_HEADER). Before that, and with a hub that sends no
-// header, the hook prints a decision only for an answer (allow) or a cancel
-// (deny); otherwise, or on any error, it prints nothing and the terminal shows
-// its own dialog. After it, the owner may be away from the terminal, so a
-// technical end (the connection lost, an unreadable answer, the hook's own time
-// limit) is a deny that tells the agent nothing was answered: only an explicit
-// "none" from the hub leaves the dialog to the terminal.
-//
-// A hub that cannot be reached at all (or that closed the connection before
-// accepting, or answered with an error status) is a deny too while the session's persisted Telegram mode is on,
-// telling the agent to write the question as plain text; with the mode off or
-// unknown the hook stays silent. A parent that is gone is always silent.
+// One rule for every technical end (no connection, an error status, a lost or
+// unreadable answer, the hook's own time limit), before the hub accepted the
+// poll or after it. While the session's Telegram mode is on, the owner reads
+// Telegram and not the terminal, so the hook never falls through to the
+// terminal dialog; the only ways to it are an explicit "none" from the hub
+// (the owner turned the mode off, or it already was) and a mode that is off or
+// unknown in the persisted state.
+//  - The parent is gone: nobody reads the output, print nothing.
+//  - The hub accepted the poll (QUESTION_ACCEPTED_HEADER, which goes out at
+//    once): deny with the ask-again reason, whatever the persisted mode says.
+//  - Otherwise, with the persisted mode on: deny. A hub that was not reached,
+//    or that answered with an error status, gets the plain-text reason; an
+//    older hub (no header) whose answer was lost, unreadable, or held until
+//    the hook's limit gets the ask-again reason.
+//  - Otherwise print nothing.
 import { z } from "zod";
 import { isAlive } from "../shared/process-alive.ts";
 import { hubPort, paths } from "../shared/config.ts";
@@ -63,8 +65,15 @@ async function decide(): Promise<Output | undefined> {
   const parsed = hookInput.safeParse(JSON.parse(await Bun.stdin.text()));
   if (!parsed.success) return undefined;
   const input = parsed.data;
-  // The persisted mode tells whether the owner counts on Telegram.
-  const notTaken = (): Output | undefined => (readSessionMode(paths().sessionsFile, input.session_id) === true ? deny(HUB_UNREACHABLE_REASON) : undefined);
+  // A hub that sends no header is an older one: it answers only when the poll is over.
+  let accepted = false;
+  // The one rule for a technical end; the persisted mode tells whether the owner counts on Telegram.
+  const technicalEnd = (why: EndedWhy | "unreachable"): Output | undefined => {
+    if (parentGone) return undefined;
+    if (accepted && why !== "unreachable") return deny(endedReason(why));
+    if (readSessionMode(paths().sessionsFile, input.session_id) !== true) return undefined;
+    return deny(why === "unreachable" ? HUB_UNREACHABLE_REASON : endedReason(why));
+  };
   let res: Response;
   try {
     // timeout: false turns off Bun's 5-minute idle timer on the held request.
@@ -82,26 +91,24 @@ async function decide(): Promise<Output | undefined> {
     });
   } catch {
     // No response: nothing listens, the hub closed the connection before accepting, or the hook's own end
-    // came first. Our own end is silent as before.
-    return parentGone || timedOut ? undefined : notTaken();
+    // came first. Its own end before any response is a request an older hub held until the limit.
+    return technicalEnd(timedOut ? "timeLimit" : "unreachable");
   }
-  if (!res.ok) return notTaken();
-  // A hub that sends no header is an older one: it answers only when the poll is over.
-  const accepted = res.headers.has(QUESTION_ACCEPTED_HEADER);
-  const ended = (why: EndedWhy): Output | undefined => (accepted && !parentGone ? deny(endedReason(why)) : undefined);
+  if (!res.ok) return technicalEnd("unreachable");
+  accepted = res.headers.has(QUESTION_ACCEPTED_HEADER);
   let body: string;
   try {
     body = await res.text();
   } catch {
-    return ended(timedOut ? "timeLimit" : "connectionLost");
+    return technicalEnd(timedOut ? "timeLimit" : "connectionLost");
   }
   let decision;
   try {
     decision = questionDecision.safeParse(JSON.parse(body));
   } catch {
-    return ended("unreadableAnswer");
+    return technicalEnd("unreadableAnswer");
   }
-  if (!decision.success) return ended("unreadableAnswer");
+  if (!decision.success) return technicalEnd("unreadableAnswer");
   const d = decision.data;
   if (d.decision === "none") return undefined;
   if (d.decision === "deny") return deny(d.reason);

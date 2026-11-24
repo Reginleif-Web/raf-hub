@@ -14,11 +14,20 @@ import { MAX_REPLY_CHARS } from "./reply-context.ts";
 const PREVIEW_CHARS = 700;
 const TEXT_LIMIT = 3700;
 const BUTTON_CHARS = 64;
+// One question of the dialog warning: the same bound as a quoted reply (MAX_REPLY_CHARS), a few lines of text,
+// so that a dozen questions still fit in one message.
+const DIALOG_QUESTION_CHARS = MAX_REPLY_CHARS;
 const ELLIPSIS = "…";
 
 export const POLL_PREFIX = "q:";
 // Goes to the agent, so always English.
 export const CANCEL_REASON = "The user cancelled the question in Telegram. Do not ask it again; end your turn and wait for their message.";
+
+// The session is being stopped, cleaned or restarted while its Telegram mode is on: a poll it had open is
+// ended, and a question that comes meanwhile is refused. The deny keeps the agent out of a terminal dialog the
+// owner cannot see; it must also not make the agent ask again, as the new session is not ready for it. Goes to
+// the agent, so always English.
+export const SESSION_RESTARTING_REASON = "The session is being stopped or restarted, so the question was not asked in Telegram. Nothing was answered and nothing was asked in the terminal. Do not ask it again now; end your turn.";
 
 // Why a poll that the owner could not answer was refused with a deny. The deny keeps the agent from falling
 // into a terminal dialog the owner cannot see; the reason tells it what happened and what to do. Goes to
@@ -135,6 +144,23 @@ export function checkedLabels(q: AskQuestion, checked: Set<number>): string {
 // An answer as the outcome line shows it: cut like a reply's quote.
 export function answerLine(answer: string): string {
   return `✅ ${cut(answer, MAX_REPLY_CHARS)}`;
+}
+
+// The warning that a session waits on a dialog in its terminal, listing the dialog's questions. The list comes
+// from the plugin and has any length and count, but the warning is one message, so it is never split or refused
+// by Telegram: each question is cut to DIALOG_QUESTION_CHARS, and the questions that do not fit in MAX_MESSAGE
+// are replaced by a line counting them.
+export function dialogWarning(m: Messages, questions: string[]): string {
+  const fitted: string[] = [];
+  for (let i = 0; i < questions.length; i++) {
+    const next = [...fitted, cut(questions[i], DIALOG_QUESTION_CHARS)];
+    const left = questions.length - i - 1;
+    if (m.dialogWaiting({ questions: left ? [...next, m.dialogMore({ count: left })] : next }).length > MAX_MESSAGE) {
+      return m.dialogWaiting({ questions: [...fitted, m.dialogMore({ count: questions.length - i })] });
+    }
+    fitted.push(next[i]);
+  }
+  return m.dialogWaiting({ questions: fitted });
 }
 
 // Cuts by code points, so an emoji is never split.

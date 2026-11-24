@@ -10,8 +10,9 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { basename, join } from "path";
 import { z } from "zod";
 import { Hub, MAX_CARDS, projectName } from "../src/hub/hub.ts";
-import { askAgainReason, CANCEL_REASON } from "../src/hub/questions.ts";
+import { askAgainReason, CANCEL_REASON, SESSION_RESTARTING_REASON } from "../src/hub/questions.ts";
 import { RIG_SESSION_LIMIT_MS } from "../src/hub/rig-session.ts";
+import { MAX_MESSAGE } from "../src/shared/chunk.ts";
 import { en } from "../src/shared/i18n/en.ts";
 import { ru } from "../src/shared/i18n/ru.ts";
 import { SessionStore } from "../src/hub/sessions.ts";
@@ -2793,6 +2794,12 @@ describe("holding across session actions", () => {
   const modeStarted = () => waitFor(() => callsOf("mode").length === 1, WAIT_MS, "the mode call");
   const stopStarted = () => waitFor(() => callsOf("stop").length === 1, WAIT_MS, "the stop call");
   const windowGone = () => waitFor(() => !hub.isConnected(SID), WAIT_MS, "the window gone");
+  // What the AskUserQuestion hook gets back from the hub for one question of a session.
+  const askQuestionOf = (sessionId: string): Promise<unknown> =>
+    fetch(`http://127.0.0.1:${port}/question`, {
+      method: "POST",
+      body: JSON.stringify({ messagingSocket: `win-${sessionId}`, session_id: sessionId, tool_input: { questions: [{ question: "Which color?", header: "Color", options: [{ label: "Red", description: "" }, { label: "Blue", description: "" }], multiSelect: false }] } }),
+    }).then(r => r.json());
   // Lets the continuations of work the test just released run (event-loop turns, not wall-clock time).
   const turns = async () => {
     for (let i = 0; i < EVENT_LOOP_TURNS; i++) await new Promise<void>(resolve => setImmediate(resolve));
@@ -3157,8 +3164,9 @@ describe("holding across session actions", () => {
     fake.pushUpdate(msg("/stop"));
     await stopStarted();
     await waitFor(() => decided !== undefined && decidedWaiting !== undefined, WAIT_MS, "the polls ended");
-    expect(decided).toEqual({ decision: "none" });
-    expect(decidedWaiting).toEqual({ decision: "none" });
+    // The mode is on, so the owner reads Telegram: a deny that tells the agent to end its turn, never the terminal dialog.
+    expect(decided).toEqual({ decision: "deny", reason: SESSION_RESTARTING_REASON });
+    expect(decidedWaiting).toEqual({ decision: "deny", reason: SESSION_RESTARTING_REASON });
     fake.pushUpdate(msg("typed answer"));
     await updatesHandled();
     gated.release();
@@ -3166,6 +3174,46 @@ describe("holding across session actions", () => {
     const next = await reopen(old);
     expect(await arrived(clock, next, 1)).toEqual(["typed answer"]);
     expect(contentsOf(old)).toEqual([]);
+  });
+
+  test("the message of a poll that the session's stop ended says the session is being restarted", async () => {
+    const gated = gatedAnswer([], rigOk({ session: SID, stopped: true, compacted: null }));
+    rig.answer("stop", gated.answer);
+    await start({ idleMs: 0 });
+    await enabled(SID);
+    const answer = askQuestionOf(SID);
+    await waitFor(() => fake.callsOf("sendMessage").length === 1, WAIT_MS, "the poll message");
+    fake.pushUpdate(msg("/stop"));
+    await stopStarted();
+    expect(await answer).toEqual({ decision: "deny", reason: SESSION_RESTARTING_REASON });
+    await waitFor(() => edits().some(e => e.endsWith(en.pollSessionRestarting)), WAIT_MS, "the outcome line");
+    gated.release();
+  });
+
+  test("a question that comes while the session is being stopped is denied with the restart reason, not left to a dialog", async () => {
+    const gated = gatedAnswer([], rigOk({ session: SID, stopped: true, compacted: null }));
+    rig.answer("stop", gated.answer);
+    await start({ idleMs: 0 });
+    await enabled(SID);
+    fake.pushUpdate(msg("/stop"));
+    await stopStarted();
+    expect(await askQuestionOf(SID)).toEqual({ decision: "deny", reason: SESSION_RESTARTING_REASON });
+    // The hub took the call, so a window that reports it is not warned about a hidden dialog.
+    expect(hub["anonymousAsk"].has(SID)).toBe(true);
+    expect(hub["polls"].size).toBe(0);
+    gated.release();
+  });
+
+  test("a question that comes while the session is being stopped gets no deny when the mode is off", async () => {
+    const gated = gatedAnswer([], rigOk({ session: SID, stopped: true, compacted: null }));
+    rig.answer("stop", gated.answer);
+    await start({ idleMs: 0 });
+    const w = await enabled(SID);
+    fake.pushUpdate(msg("/stop"));
+    await stopStarted();
+    await req(w, { op: "disable" });
+    expect(await askQuestionOf(SID)).toEqual({ decision: "none" });
+    gated.release();
   });
 
   test("an in-flight replay is taken with its result and cannot overtake what comes after", async () => {
@@ -3930,6 +3978,8 @@ describe("questions", () => {
     const m = await a.next("catchUp");
     abort.abort();
     await answer;
+    // The client resolves on its own abort; the hub learns of the closed request later, over the socket.
+    await waitFor(() => hub["polls"].size === 0);
     a.send({ type: "caughtUp", id: m.id });
     await settle();
     expect(fake.callsOf("sendMessage")).toEqual([]);
@@ -4363,21 +4413,29 @@ ${en.pollHookEnded}`));
     expect(sentTexts()).toEqual([Q1_TEXT, Q3_TEXT]);
   });
 
-  test("«Cancel» denies the shown poll and every waiting one of the session", async () => {
+  test("«Cancel» denies only the shown poll, and the next waiting one is then shown", async () => {
     await startHub();
     await enabled("a");
     const first = ask([Q1]);
     const msg = await shown();
-    const second = ask([Q2]);
+    const second = ask([Q3]);
     await queued(2);
     const third = ask([Q3]);
     await queued(3);
+    const waiting = [pending(second), pending(third)];
     press(dataOf(msg, 2, 1), fake.lastMessageId);
     expect(await first).toEqual({ decision: "deny", reason: CANCEL_REASON });
-    expect(await second).toEqual({ decision: "deny", reason: CANCEL_REASON });
-    expect(await third).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    const next = await polled(2);
     await settle();
-    expect(sentTexts()).toEqual([Q1_TEXT]);
+    expect(waiting.map(w => w.settled)).toEqual([false, false]);
+    expect(sentTexts()).toEqual([Q1_TEXT, Q3_TEXT]);
+    press(dataOf(next, 2, 1), fake.lastMessageId);
+    expect(await second).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    const last = await polled(3);
+    await settle();
+    expect(waiting[1].settled).toBe(false);
+    press(dataOf(last, 0), fake.lastMessageId);
+    expect(await third).toEqual({ decision: "allow", answers: { "Which size?": "Small" } });
   });
 
   test('a "!" message denies the shown poll and every waiting one, and reaches the agent once', async () => {
@@ -4490,6 +4548,127 @@ ${en.pollHookEnded}`));
     a.close();
     expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
     await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`));
+  });
+
+  // The window of session "a" with a terminal entrypoint, so that a dialog report of it is looked at.
+  const terminalWindow = async () => {
+    const a = await enabled("a");
+    a.send({ type: "session", sessionId: "a", cwd: CWD, entrypoint: "cli" });
+    await settle();
+    return a;
+  };
+  const askWithId = (toolUseId: string, questions: object[]): Promise<unknown> =>
+    fetch(`http://127.0.0.1:${port}/question`, {
+      method: "POST",
+      body: JSON.stringify({ messagingSocket: "win-a", session_id: "a", tool_use_id: toolUseId, tool_input: { questions } }),
+    }).then(r => r.json());
+  // What the hub holds of the session's dialog warnings: the taken calls, the anonymous flag, the warned calls.
+  const dialogState = (sid: string) => [hub["taken"].has(sid), hub["anonymousAsk"].has(sid), hub["warnedDialogs"].has(sid)];
+
+  test("a window that switches to another session ends the polls and the dialog state of the one it left, as a disconnect does", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    a.send({ type: "dialog", toolUseId: "d1", questions: ["Warned?"] });
+    await waitFor(() => sentTexts().length === 1);
+    const first = askWithId("t1", [Q1]);
+    await shown(2);
+    const second = ask([Q2]);
+    await queued(2);
+    expect(dialogState("a")).toEqual([true, true, true]);
+    a.send({ type: "session", sessionId: "a2", cwd: CWD });
+    expect(await first).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
+    expect(await second).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
+    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`));
+    expect(dialogState("a")).toEqual([false, false, false]);
+  });
+
+  test("a window that resumes the same session keeps its polls and dialog state", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    const answer = askWithId("t1", [Q1]);
+    const msg = await shown();
+    a.send({ type: "session", sessionId: "a", cwd: CWD, entrypoint: "cli" });
+    await settle();
+    expect(dialogState("a")).toEqual([true, false, false]);
+    press(dataOf(msg, 0), fake.lastMessageId);
+    expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+  });
+
+  test("a window that switches away from a session another window still holds ends nothing of it", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    await plugin("a", "win-a-other");
+    const answer = askWithId("t1", [Q1]);
+    const msg = await shown();
+    a.send({ type: "session", sessionId: "a2", cwd: CWD });
+    await waitFor(() => hub.isConnected("a2"));
+    await settle();
+    expect(dialogState("a")).toEqual([true, false, false]);
+    press(dataOf(msg, 0), fake.lastMessageId);
+    expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+  });
+
+  // Past this many ids of a session the hub forgets the oldest (MAX_CALL_IDS of hub.ts, the bound of the batch ids).
+  const CALL_IDS = 200;
+  const OVERFLOW = 50;
+
+  test("the taken calls of a session are bounded to the newest, and the call of an open poll is never forgotten", async () => {
+    await startHub();
+    await terminalWindow();
+    const answer = askWithId("open", [Q1]);
+    const msg = await shown();
+    for (let i = 0; i < CALL_IDS + OVERFLOW; i++) hub["takeCall"]("a", `call-${i}`);
+    const ids = hub["taken"].get("a") ?? new Set<string>();
+    expect(ids.size).toBe(CALL_IDS);
+    expect(ids.has("open")).toBe(true);
+    expect(ids.has(`call-${CALL_IDS + OVERFLOW - 1}`)).toBe(true);
+    expect(ids.has("call-0")).toBe(false);
+    press(dataOf(msg, 0), fake.lastMessageId);
+    expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+  });
+
+  test("the warned dialogs of a session are bounded to the newest", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    for (let i = 0; i < CALL_IDS + OVERFLOW; i++) a.send({ type: "dialog", toolUseId: `dialog-${i}`, questions: ["Q?"] });
+    await waitFor(() => sentTexts().length === CALL_IDS + OVERFLOW, WAIT_MS, "every dialog warned");
+    const ids = hub["warnedDialogs"].get("a") ?? new Set<string>();
+    expect(ids.size).toBe(CALL_IDS);
+    expect(ids.has(`dialog-${CALL_IDS + OVERFLOW - 1}`)).toBe(true);
+    expect(ids.has("dialog-0")).toBe(false);
+  });
+
+  // A dialog report is the plugin's own list of questions, of any length and count; its warning is one message.
+  test("a dialog warning with very many questions is one message within Telegram's limit that counts the questions left out", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    const questions = Array.from({ length: 100 }, (_, i) => `Question number ${i} ${"x".repeat(100)}`);
+    a.send({ type: "dialog", toolUseId: "many", questions });
+    await waitFor(() => sentTexts().length >= 1, WAIT_MS, "the warning");
+    await settle();
+    const texts = sentTexts().map(String);
+    expect(texts.length).toBe(1);
+    expect(texts[0].length).toBeLessThanOrEqual(MAX_MESSAGE);
+    expect(texts[0]).toContain(questions[0]);
+    const left = questions.filter(q => !texts[0].includes(q)).length;
+    expect(left).toBeGreaterThan(0);
+    expect(texts[0]).toContain(en.dialogMore({ count: left }));
+  });
+
+  test("a dialog warning with one very long question cuts it, without splitting an emoji, within Telegram's limit", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    const long = "😀".repeat(5000);
+    a.send({ type: "dialog", toolUseId: "long", questions: [long, "Second?"] });
+    await waitFor(() => sentTexts().length >= 1, WAIT_MS, "the warning");
+    await settle();
+    const texts = sentTexts().map(String);
+    expect(texts.length).toBe(1);
+    expect(texts[0].length).toBeLessThanOrEqual(MAX_MESSAGE);
+    expect(texts[0]).not.toContain(long);
+    expect(texts[0]).toContain("😀…");
+    expect(texts[0]).toContain("Second?");
+    expect(texts[0]).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   });
 
   test("turning the mode off moves the poll to the terminal", async () => {

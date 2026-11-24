@@ -68,9 +68,11 @@ export const en = {
   pollCancelled: "✖️ Poll cancelled",
   pollMovedToTerminal: "⌛ The poll was moved to the terminal (/terminal shows it here)",
   pollAskedAgain: "↩️ The poll was closed; the agent was asked to ask it again",
+  pollSessionRestarting: "↩️ The poll was closed because the session is being stopped or restarted; the agent was told not to ask it again now",
   pollHookEnded: "⌛ The poll ended on the terminal side (Esc, the time limit or a restart). If the agent still waits for an answer, it may be a dialog in the terminal: /terminal shows it here, or answer it there",
   dialogWaiting: ({ questions }: { questions: string[] }) =>
     `⚠️ The session waits for an answer to a dialog in its terminal, and your messages wait behind it:\n${questions.map(q => `• ${q}`).join("\n")}\nAnswer it on the PC. A session started with /run has /terminal, which shows and answers such a dialog here.`,
+  dialogMore: ({ count }: { count: number }) => `…and ${count} more`,
   pollHead: ({ index, total, header }: { index: number; total: number; header: string | undefined }) =>
     total > 1 ? `Question ${index} of ${total}${header ? `: ${header}` : ""}` : header ?? "",
   pollDone: "✅ Done",
