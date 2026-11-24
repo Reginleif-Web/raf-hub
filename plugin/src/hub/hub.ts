@@ -48,7 +48,7 @@ import { accountOf, SessionStore, topicName } from "./sessions.ts";
 import { isThreadNotFound, TelegramError } from "./telegram.ts";
 import { media, richPhotos, richToMarkdown } from "./rich.ts";
 import { withContext } from "./reply-context.ts";
-import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, dialogWarning, parsePollPress, POLL_PREFIX, questionButtons, questionText, SESSION_RESTARTING_REASON, withOutcome } from "./questions.ts";
+import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, dialogWarning, NOT_SHOWN_REASON, parsePollPress, POLL_PREFIX, questionButtons, questionText, SESSION_RESTARTING_REASON, withOutcome } from "./questions.ts";
 import { richPieces } from "./rich-out.ts";
 import { DEFAULT_VIDEO_TOOLS, probeVideo, thumbPath } from "./video.ts";
 import { EXEC_CARD_MS, EXEC_CHECK_MS, EXEC_MAX_AGE_MS, Execs } from "./exec.ts";
@@ -915,7 +915,7 @@ ${msg.text}`);
         this.catchUps.get(msg.id)?.();
         return;
       case "dialog":
-        this.spawn(this.onDialog(ws, msg.toolUseId, msg.questions));
+        this.onDialog(ws, msg.toolUseId, msg.questions);
         return;
     }
   }
@@ -1194,14 +1194,17 @@ ${msg.text}`);
   // Every call the hub took is in `taken` before its hook returns, so before its tool_use is written to the
   // transcript: a call missing from `taken` is no hub poll, however short ago it was written. A supervised
   // session shows its terminal itself, and only a terminal (cli) session has a dialog to wait on.
-  private async onDialog(ws: WS, toolUseId: string, questions: string[]): Promise<void> {
+  //
+  // Whether a supervisor owns the session is a synchronous local check (its descriptor and a live supervisor
+  // pid), not a request to it: a request that fails for a moment would give a false warning. With nothing
+  // awaited between the checks and the notice, the call is marked warned exactly when the notice is sent.
+  private onDialog(ws: WS, toolUseId: string, questions: string[]): void {
     const sid = ws.data.sessionId;
     if (!sid || ws.data.entrypoint !== CLI_ENTRYPOINT || !this.store.get(sid)?.enabled) return;
     if (this.taken.get(sid)?.has(toolUseId) || this.anonymousAsk.has(sid) || this.pollsOf(sid).length > 0) return;
     if (this.warnedDialogs.get(sid)?.has(toolUseId)) return;
-    // Before the awaited check below, so a second report of the call meanwhile finds it warned.
+    if (this.terminals?.supervised(sid)) return;
     this.rememberCall(this.warnedDialogs, sid, toolUseId);
-    if (this.terminals && (await this.terminals.running(sid))) return;
     this.notice(sid, dialogWarning(this.m(), questions), "warning");
   }
 
@@ -1256,18 +1259,21 @@ ${msg.text}`);
   }
 
   // Ends one poll. By default the next poll of the session, if any, starts; a bulk end of the session's
-  // polls passes advance=false, since none is left to start.
+  // polls passes advance=false, since none is left to start. Every end goes through here, so this is the one
+  // place that hands the poll's waiting text answer to the agent as ordinary messages: they were sent before
+  // whatever the owner sends next, and go into the session's batch in this same tick, ahead of it.
   private async finishPoll(p: Poll, decision: QuestionDecision, outcome: string, advance = true): Promise<void> {
     if (p.done) return;
     p.done = true;
     this.polls.delete(p.key);
+    const flushed = this.takeAnswer(p.key);
     if (advance) this.startNext(p.sessionId);
     p.outcomes[p.index] = outcome;
     p.resolve(decision);
     // The agent has the answers now; with none, it never gets them.
     if (decision.decision === "allow") for (const id of p.taken) this.clearTaken(id);
     this.log.info(`question poll ${p.key} of session ${p.sessionId}: ${decision.decision}`);
-    await this.showOutcome(p, p.index);
+    await Promise.all([flushed, this.showOutcome(p, p.index)]);
   }
 
   // A sent question shows its outcome instead of the buttons; one still in
@@ -1290,8 +1296,12 @@ ${msg.text}`);
       p.outcomes[i] = answerLine(answer);
       p.index++;
       p.checked = new Set();
+      // A text answer waiting for the question just answered is no answer to the next one: it goes to the
+      // agent now, ahead of whatever the owner sends while the next question is not shown yet. When this
+      // answer came from the group itself, the group is already taken and this does nothing.
+      const flushed = this.takeAnswer(p.key);
       this.queueQuestion(p);
-      await this.showOutcome(p, i);
+      await Promise.all([flushed, this.showOutcome(p, i)]);
       return;
     }
     await this.finishPoll(p, { decision: "allow", answers: { ...p.answers } }, answerLine(answer));
@@ -1750,7 +1760,7 @@ ${msg.text}`);
     // next poll of the session, if any, is shown.
     const pollKey = item.notice ? undefined : POLL_ITEM.exec(item.id)?.[1];
     const poll = pollKey ? this.polls.get(pollKey) : undefined;
-    if (poll) this.spawn(this.finishPoll(poll, { decision: "deny", reason: askAgainReason("notShown") }, this.m().pollAskedAgain));
+    if (poll) this.spawn(this.finishPoll(poll, { decision: "deny", reason: NOT_SHOWN_REASON }, this.m().pollNotShown));
     if (item.notice) {
       this.outbox.remove(item.id);
       this.settled(item);
@@ -1987,9 +1997,8 @@ ${msg.text}`);
     const role = pollRole(m, this.botUsername);
     if (role === "pass") return m;
     if (role === "cancel") {
+      // Ending the poll hands the answer messages still waiting to the agent, ahead of this one.
       this.endPolls(sessionId, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled);
-      // Answer messages still waiting reach the agent before this one.
-      await this.takeAnswer(p.key);
       const plain = withoutInterrupt(m);
       return plain.text === "" ? undefined : plain;
     }
@@ -2029,7 +2038,8 @@ ${msg.text}`);
     this.clearTimer(g.timer);
     const p = g.poll;
     if (p.done || p.index !== g.index) {
-      for (const m of g.messages) await this.deliver(g.api, p.sessionId, m);
+      // All of them start in this tick, in order: none of the owner's later messages can slip between them.
+      await Promise.all(g.messages.map(m => this.deliver(g.api, p.sessionId, m)));
       return;
     }
     this.log.info(`question poll ${key}: answered by message(s) ${g.messages.map(m => m.message_id).join(", ")}`);
@@ -2486,7 +2496,8 @@ ${msg.text}`);
     const [decision, outcome]: [QuestionDecision, string] = this.store.get(sessionId)?.enabled
       ? [{ decision: "deny", reason: SESSION_RESTARTING_REASON }, this.m().pollSessionRestarting]
       : [{ decision: "none" }, this.m().pollMovedToTerminal];
-    for (const p of this.endPolls(sessionId, decision, outcome).polls) this.spawn(this.takeAnswer(p.key));
+    // Ending the polls hands their waiting answer messages to the batch below, so they are held with the rest.
+    this.endPolls(sessionId, decision, outcome);
     for (const entry of this.batchItems.get(sessionId) ?? []) {
       entry.captured = true;
       for (const message of entry.messages) this.hold(sessionId, { message });

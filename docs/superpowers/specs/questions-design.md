@@ -33,9 +33,10 @@ that is, shows the dialog in the terminal. All the "fallback" cases below rely o
 
 **Principle.** While Telegram mode is on, a question never ends silently in a terminal dialog the owner cannot see,
 and an answer belongs to exactly one `AskUserQuestion` call. So a poll ends with "no decision" (the dialog opens in the
-terminal) only when the owner chose the terminal or the dialog is going away anyway; every other end, on the hub side
-and on the hook side, is a refusal (`deny`) with a reason that tells the agent what to do. The table under "End of the
-wait without an answer" lists every path.
+terminal) only when the owner chose the terminal (the mode is off) or the dialog is going away anyway; every other end,
+on the hub side and on the hook side, is a refusal (`deny`) with a reason that tells the agent what to do. An explicit
+`none` that reaches the hook while the persisted mode is still on is itself such an end, see below. The table under
+"End of the wait without an answer" lists every path.
 
 **Where the poll is.** Telegram mode is on: the poll is only in the topic; in the terminal, while waiting, the hook's
 status line "Waiting for an answer in Telegram" (`statusMessage`). Mode is off: the hook decides nothing, the dialog is in the
@@ -133,18 +134,26 @@ a valid decision, or the hook's own time limit ran out. One function in the hook
 decides all of them, in this order:
 
 1. The parent process is gone: silent, nothing reads the output.
-2. The hub accepted the poll (the header was seen) and the end is anything but "unreachable": a refusal with an English
-   reason. It says: the hub took the question, nothing was answered, nothing was asked in the terminal, and if the answer
-   is still needed, ask again with a single `AskUserQuestion` call (`src/hook/question-reasons.ts`).
-3. Otherwise the persisted Telegram mode of the session is read (`readSessionMode`, read-only): on, a refusal (the hub
-   is unreachable, write the question as plain text and end the turn, or the ended reason of step 2); off, unknown or the
-   file unreadable, silent, the dialog opens in the terminal.
+2. The hub accepted the poll (the header was seen): a refusal with an English reason.
+3. Otherwise the persisted Telegram mode of the session is read (`readSessionMode`, read-only): on, a refusal; off,
+   unknown or the file unreadable, silent, the dialog opens in the terminal. An explicit `none` takes the same step 3.
 
-An explicit `none` from the hub stays silent (the dialog opens in the terminal). So with the mode on the hook never
-falls through to the terminal dialog except when nobody reads its output.
+The reason (`src/hook/question-reasons.ts`) never makes the agent loop. A lost connection and the time limit need an
+outside event per round, so they say: the hub took the question, nothing was answered, nothing was asked in the
+terminal, and if the answer is still needed, ask again with a single `AskUserQuestion` call. An end that would repeat
+by itself (hub not reached, error status, unreadable answer, `none` with the mode on) says: do not call again, write
+the question as plain text and end the turn.
 
-**Mixed versions.** A new hook with a hub that sends no header (an older hub) never saw an acceptance, so it behaves
-as before: every technical end is silent. An old hook with a new hub parses the body as JSON as before.
+An explicit `none` from the hub opens the terminal dialog (the hook stays silent) only when the persisted mode is not
+on. The hub writes the mode off synchronously (`SessionStore.setEnabled` saves the file before it answers the polls
+none), so a `none` that is the owner's choice of the terminal always finds the mode off. A `none` that finds the mode
+on comes from a hub that answers none for another reason, and is a refusal with the plain-text reason. A session that is missing from the file, or a
+file that cannot be read, stays silent, as in step 3. So with the mode on the hook never falls through to the terminal
+dialog except when nobody reads its output.
+
+**Mixed versions.** A new hook with a hub that sends no header (an older hub) never saw an acceptance, so step 3
+decides every end by the persisted mode. An explicit `none` from an older hub with the mode on is read
+the same way as from a new one (a refusal). An old hook with a new hub parses the body as JSON as before.
 
 **Hub unreachable.** The request fails before any response (connection refused, or the connection closed before the
 headers) or the answer has an error status. The persisted mode is the `sessions.json` of the state directory; the hook
@@ -183,7 +192,8 @@ outlive the hub's knowledge of it.
 
 | Path | Decision | Topic message |
 |---|---|---|
-| Mode off at the request, or turned off while open | none (owner chose the terminal) | moved to the terminal |
+| Mode off at the request, or turned off while open | none (owner chose the terminal); the hook is silent only because the persisted mode is already off | moved to the terminal |
+| An explicit none while the persisted mode is on | deny, write the question as plain text and end the turn (printed by the hook) | nothing |
 | Esc, window closed (request aborted) | none, for that poll only (the hook is gone and prints nothing) | ended on the terminal side, /terminal or answer there if the agent still waits |
 | The hook's own time limit after acceptance | deny, ask again (printed by the hook); the request is aborted, so the hub sees the same end as above | same |
 | Session being started (`isStarting`) or being stopped at the request, mode off | none, no acceptance header (the session ends and the dialog goes with it) | nothing |
@@ -195,9 +205,9 @@ outlive the hub's knowledge of it.
 | The window moves to another session and no other window holds this one | deny, ask again (`windowGone`), all polls of the session; the dialog state of the session is released | closed, agent asked to ask again |
 | Hub stops gracefully | deny, ask again (`hubStopping`), all polls | closed, agent asked to ask again |
 | The window of the session is gone, or a button is pressed with no connected window | deny, ask again (`windowGone`) | same |
-| Telegram did not accept the poll message | deny, ask again (`notShown`); the next poll is shown | same |
+| Telegram did not accept the poll message | deny, plain-text advice (`NOT_SHOWN_REASON`): do not call the tool again, write the question as plain text and end the turn; the next poll is shown | the existing "Telegram rejected" notice; the poll message was never sent, so it has no outcome line |
 | Hub crash or restart without a graceful stop after acceptance | deny, ask again (printed by the hook: connection lost) | nothing (the hub is gone) |
-| The body of the answer is unreadable after acceptance | deny, ask again (printed by the hook) | nothing |
+| The body of the answer is unreadable after acceptance | deny, write the question as plain text and end the turn (printed by the hook) | nothing |
 | Hub unreachable at the request or answers with an error status, mode on in `sessions.json` | deny, write the question as plain text and end the turn (printed by the hook) | nothing (the hub is gone) |
 | Hub unreachable, closed the connection before acceptance or answered with an error status, mode off or unknown | none by silence: the hook prints nothing | nothing |
 | The parent process of the hook is gone | none by silence: nothing reads the output | ended on the terminal side |
@@ -206,6 +216,18 @@ A denied poll from the hub tells the agent why the question got no answer in Tel
 nothing was asked in the terminal, and to ask again with a single `AskUserQuestion` call. A refusal printed by the
 hook says the hub took the question, with the same facts. Pressing a button of a closed
 poll answers "The poll is outdated" and removes the buttons.
+
+The ask-again advice is given only for ends that need an outside event before the next round: a hub restart
+(`hubStopping`), a lost window (`windowGone`), the hook's 24 h limit, an owner's press or cancel. A rejection by Telegram
+is the one end that could repeat on every new call with no outside event, so it is not an ask-again: the agent is told to
+write the question as plain text.
+
+**A text answer waiting when the poll ends.** An owner's text that the hub took as the answer to a question (it waits in
+its answer group for the quiet time of a batch) must reach the agent before any later message of the owner, whatever ends
+the poll. `finishPoll`, the one place every poll ends, flushes the group of the poll at every end that is not the answer
+itself (cancel, a closed or lost window, the hook's abort, the mode turned off, `notShown`, the bulk ends of the session);
+the advance to the next question of a multi-question poll flushes it too. A flush of a group that is already gone is a
+no-op.
 
 Known facts about the terminal side, not more: the hub sees an Esc or a killed hook only as an aborted request, so it cannot
 tell the time limit, Esc and a restart apart; `sendInterrupt` writes a prompt to the window's messaging socket and is
@@ -226,8 +248,12 @@ the topic gets one warning notice if all of this holds:
   ended in a refusal included) before the hook returns, which is before Claude Code writes the call to the transcript.
   A poll the owner sent to the terminal by turning the mode off is no longer a call the hub took. A call missing from that set is therefore no hub poll, however short ago it was written, so no
   timer decides it. A session whose hook sent no id (an older hook) is never warned, as its calls cannot be told apart;
-- the session holds no open or queued poll, and no terminal supervisor runs for it (the supervised terminal shows
-  such a dialog itself).
+- the session holds no open or queued poll, and no terminal supervisor owns it (the supervised terminal shows such a
+  dialog itself). Whether a supervisor owns the session is a synchronous local check (`TerminalRelay.supervised`): its
+  descriptor exists and the supervisor pid it records is alive; a descriptor that exists but cannot be read counts as
+  supervised. It is not a request to the supervisor, because a request that fails for a moment would give a false
+  warning. Nothing is awaited between the check and the notice, so the call is marked warned only when the notice is
+  sent.
 
 The notice quotes the question texts, says that the session waits on a dialog in its terminal and that messages wait
 behind it, and that it must be answered on the PC (a session started with `/run` has `/terminal`). One notice per

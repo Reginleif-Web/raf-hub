@@ -2,20 +2,26 @@
 // PreToolUse hook for AskUserQuestion: while Telegram mode is on, the hub asks
 // the questions in the topic and holds the request until they are answered.
 //
-// One rule for every technical end (no connection, an error status, a lost or
-// unreadable answer, the hook's own time limit), before the hub accepted the
-// poll or after it. While the session's Telegram mode is on, the owner reads
-// Telegram and not the terminal, so the hook never falls through to the
-// terminal dialog; the only ways to it are an explicit "none" from the hub
-// (the owner turned the mode off, or it already was) and a mode that is off or
-// unknown in the persisted state.
+// One rule for every end that is not an answer (no connection, an error status,
+// a lost or unreadable answer, the hook's own time limit, an explicit "none"),
+// before the hub accepted the poll or after it. While the session's Telegram
+// mode is on, the owner reads Telegram and not the terminal, so the terminal
+// dialog opens only when the persisted mode of the session is not on at the
+// moment the hook decides (off, unknown, a session missing from the file or an
+// unreadable file). A new hub answers "none" only with the mode off, but an
+// older one also does for technical reasons with the mode on (a second call
+// ended the poll, the window went away, the hub was stopping), so "none" alone
+// never opens the dialog.
 //  - The parent is gone: nobody reads the output, print nothing.
+//  - An explicit "none": with the persisted mode on, deny with the plain-text
+//    reason; otherwise print nothing.
 //  - The hub accepted the poll (QUESTION_ACCEPTED_HEADER, which goes out at
-//    once): deny with the ask-again reason, whatever the persisted mode says.
-//  - Otherwise, with the persisted mode on: deny. A hub that was not reached,
-//    or that answered with an error status, gets the plain-text reason; an
-//    older hub (no header) whose answer was lost, unreadable, or held until
-//    the hook's limit gets the ask-again reason.
+//    once): deny, whatever the persisted mode says.
+//  - Otherwise, with the persisted mode on: deny.
+//  A lost connection and the hook's limit ask for the question again: each
+//  needs an outside event per round. An end that would repeat by itself (a hub
+//  not reached, an error status, an unreadable answer, "none" with the mode on)
+//  gets the plain-text reason, so the agent never loops.
 //  - Otherwise print nothing.
 import { z } from "zod";
 import { isAlive } from "../shared/process-alive.ts";
@@ -68,11 +74,10 @@ async function decide(): Promise<Output | undefined> {
   // A hub that sends no header is an older one: it answers only when the poll is over.
   let accepted = false;
   // The one rule for a technical end; the persisted mode tells whether the owner counts on Telegram.
-  const technicalEnd = (why: EndedWhy | "unreachable"): Output | undefined => {
-    if (parentGone) return undefined;
-    if (accepted && why !== "unreachable") return deny(endedReason(why));
-    if (readSessionMode(paths().sessionsFile, input.session_id) !== true) return undefined;
-    return deny(why === "unreachable" ? HUB_UNREACHABLE_REASON : endedReason(why));
+  const modeOn = () => readSessionMode(paths().sessionsFile, input.session_id) === true;
+  const technicalEnd = (why: EndedWhy | "notTaken"): Output | undefined => {
+    if (parentGone || !(accepted || modeOn())) return undefined;
+    return deny(why === "notTaken" ? HUB_UNREACHABLE_REASON : endedReason(why));
   };
   let res: Response;
   try {
@@ -92,9 +97,9 @@ async function decide(): Promise<Output | undefined> {
   } catch {
     // No response: nothing listens, the hub closed the connection before accepting, or the hook's own end
     // came first. Its own end before any response is a request an older hub held until the limit.
-    return technicalEnd(timedOut ? "timeLimit" : "unreachable");
+    return technicalEnd(timedOut ? "timeLimit" : "notTaken");
   }
-  if (!res.ok) return technicalEnd("unreachable");
+  if (!res.ok) return technicalEnd("notTaken");
   accepted = res.headers.has(QUESTION_ACCEPTED_HEADER);
   let body: string;
   try {
@@ -106,11 +111,13 @@ async function decide(): Promise<Output | undefined> {
   try {
     decision = questionDecision.safeParse(JSON.parse(body));
   } catch {
-    return technicalEnd("unreadableAnswer");
+    return technicalEnd("notTaken");
   }
-  if (!decision.success) return technicalEnd("unreadableAnswer");
+  if (!decision.success) return technicalEnd("notTaken");
   const d = decision.data;
-  if (d.decision === "none") return undefined;
+  // The terminal dialog opens only when the persisted mode is not on right now: a new hub answers none only
+  // with the mode off, but an older one also does for technical ends, and then the owner reads Telegram.
+  if (d.decision === "none") return parentGone || !modeOn() ? undefined : deny(HUB_UNREACHABLE_REASON);
   if (d.decision === "deny") return deny(d.reason);
   return { permissionDecision: "allow", permissionDecisionReason: "Answered in Telegram", updatedInput: { ...input.tool_input, answers: d.answers } };
 }

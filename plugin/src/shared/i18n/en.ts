@@ -68,6 +68,7 @@ export const en = {
   pollCancelled: "✖️ Poll cancelled",
   pollMovedToTerminal: "⌛ The poll was moved to the terminal (/terminal shows it here)",
   pollAskedAgain: "↩️ The poll was closed; the agent was asked to ask it again",
+  pollNotShown: "↩️ Telegram did not accept the poll; the agent was asked to write the question as text",
   pollSessionRestarting: "↩️ The poll was closed because the session is being stopped or restarted; the agent was told not to ask it again now",
   pollHookEnded: "⌛ The poll ended on the terminal side (Esc, the time limit or a restart). If the agent still waits for an answer, it may be a dialog in the terminal: /terminal shows it here, or answer it there",
   dialogWaiting: ({ questions }: { questions: string[] }) =>

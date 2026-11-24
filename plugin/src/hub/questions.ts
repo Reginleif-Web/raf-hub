@@ -32,13 +32,20 @@ export const SESSION_RESTARTING_REASON = "The session is being stopped or restar
 // Why a poll that the owner could not answer was refused with a deny. The deny keeps the agent from falling
 // into a terminal dialog the owner cannot see; the reason tells it what happened and what to do. Goes to
 // the agent, so always English.
-export type AskAgainWhy = "hubStopping" | "windowGone" | "notShown";
+export type AskAgainWhy = "hubStopping" | "windowGone";
 
 const ASK_AGAIN_WHY: Record<AskAgainWhy, string> = {
   hubStopping: "the Telegram hub was restarting",
   windowGone: "the connection of this session to the Telegram hub was lost",
-  notShown: "Telegram did not accept the message with the question (it may be too long or malformed)",
 };
+
+// Telegram rejected the message with the question. A rejection that persists (a text too long or malformed)
+// repeats on every new call, and no outside event stops that, so the agent is not told to call the tool again:
+// it writes the question as plain text, which reaches the topic as a normal message. Every other ask-again
+// reason ends with an outside event (a hub restart, a lost window, the 24 h limit, an owner's press) before
+// the next round. Goes to the agent, so always English.
+export const NOT_SHOWN_REASON =
+  "Telegram did not accept the message with the question (it may be too long or malformed), so it was not shown, and nothing was asked in the terminal. Do not call AskUserQuestion again for this question. Write the question as plain text in your reply, shorter or simpler if it was long, and end your turn; the owner answers in a normal message.";
 
 export function askAgainReason(why: AskAgainWhy): string {
   return `The question got no answer in Telegram because ${ASK_AGAIN_WHY[why]}. Nothing was answered and nothing was asked in the terminal. Ask it again with a single AskUserQuestion call, shorter or simpler if it was long.`;

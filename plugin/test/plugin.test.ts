@@ -1259,6 +1259,8 @@ describe("a dialog waiting in the terminal", () => {
 
   test("a session under a terminal supervisor gets no warning", async () => {
     await cliCore();
+    // The supervisor owns the session when its descriptor records a live pid; the hub asks nothing of it.
+    writeFileSync(join(state, `${SID}.json`), JSON.stringify({ pid: process.pid }));
     hub["terminals"] = new TerminalRelay({
       directory: state,
       known: () => true,

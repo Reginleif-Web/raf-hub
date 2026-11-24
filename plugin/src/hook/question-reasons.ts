@@ -2,11 +2,10 @@
 // and the owner may be away from the terminal, so its dialog must not open on its own. The text is for the
 // agent, so it is English like askAgainReason in the hub.
 
-export type EndedWhy = "connectionLost" | "unreadableAnswer" | "timeLimit";
+export type EndedWhy = "connectionLost" | "timeLimit";
 
 const ENDED_WHY: Record<EndedWhy, string> = {
   connectionLost: "the connection to the Telegram hub was lost while the question waited for an answer",
-  unreadableAnswer: "the Telegram hub's answer could not be read",
   timeLimit: "the time limit of the question hook ran out while the question waited for an answer",
 };
 
@@ -16,8 +15,8 @@ export function endedReason(why: EndedWhy): string {
   return `The Telegram hub took the question, but ${ENDED_WHY[why]}. Nothing was answered and nothing was asked in the terminal. If the answer is still needed, ask it again with a single AskUserQuestion call.`;
 }
 
-// The hub did not answer, or answered with an error status, while the session is in Telegram mode. A retry
-// would hit the same wall, so the agent is told to put the question in its text, which reaches the topic
-// once the hub is back.
+// The hub did not answer, answered with an error status or something unreadable, or answered "none" while
+// the session is in Telegram mode. A retry would hit the same wall, so the agent is told to put the question
+// in its text, which reaches the topic once the hub is back.
 export const HUB_UNREACHABLE_REASON =
-  "The Telegram hub is unreachable or could not take the question, so the question could not be shown in Telegram, and nothing was asked in the terminal. Do not call AskUserQuestion again. Write the question as plain text in your reply and end your turn; the owner answers in a normal message.";
+  "The Telegram hub is unreachable or could not take the question, so the question got no answer in Telegram, and nothing was asked in the terminal. Do not call AskUserQuestion again. Write the question as plain text in your reply and end your turn; the owner answers in a normal message.";

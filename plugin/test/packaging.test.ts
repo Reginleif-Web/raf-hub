@@ -457,11 +457,11 @@ describe("AskUserQuestion hook", () => {
       expectAskAgain(denyOf(r.stdout));
     });
 
-    test("an unreadable answer denies with the ask-again reason", async () => {
+    test("an unreadable answer denies with the plain-text reason, which cannot loop", async () => {
       const { port } = await acceptingHub("garbage");
       const r = await runQuestion(port, INPUT);
       expect(r.status).toBe(0);
-      expectAskAgain(denyOf(r.stdout));
+      expectUnreachable(denyOf(r.stdout));
     });
 
     test("the hook's own time limit denies with the ask-again reason and ends the poll in the hub", async () => {
@@ -472,9 +472,11 @@ describe("AskUserQuestion hook", () => {
       await waitFor(() => seen.aborted === 1);
     });
 
-    test("an explicit none from the hub still leaves the dialog to the terminal", async () => {
+    test("an explicit none leaves the dialog to the terminal only while the persisted mode is not on", async () => {
       const { port } = await acceptingHub("none");
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
       expect(await runQuestion(port, INPUT)).toEqual({ status: 0, stdout: "" });
+      expectUnreachable(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
     });
 
     test("the parent gone is silent, the poll still ends in the hub", async () => {
@@ -504,14 +506,27 @@ describe("AskUserQuestion hook", () => {
   // An old hub sends no acceptance header. While the session's Telegram mode is on, the owner may be away, so a
   // lost answer is a deny that tells the agent to ask again; with the mode off or unknown the hook stays silent.
   describe("with a hub that does not announce acceptance", () => {
-    test("an explicit none stays silent, even with the mode on", async () => {
+    // An older hub also answers none for technical reasons while the mode is on (a second call ended the first
+    // poll, the window went away, the hub was stopping), so none alone never opens the dialog.
+    test("an explicit none denies with the plain-text reason when the mode is on, and stays silent otherwise", async () => {
       const { port } = await fakeHub({ decision: "none" });
-      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).toEqual({ status: 0, stdout: "" });
+      expectUnreachable(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
+      expect(await runQuestion(port, INPUT)).toEqual({ status: 0, stdout: "" });
     });
 
-    test("a broken answer denies with the ask-again reason when the mode is on, and stays silent otherwise", async () => {
+    test("an explicit none with the session missing from the file or the file unreadable stays silent", async () => {
+      const { port } = await fakeHub({ decision: "none" });
+      const unknown = tempDir();
+      writeFileSync(join(unknown, "sessions.json"), JSON.stringify({ other: { title: "t", project: "p", enabled: true } }));
+      const broken = tempDir();
+      writeFileSync(join(broken, "sessions.json"), "{ not json");
+      for (const dir of [unknown, broken]) expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: dir })).toEqual({ status: 0, stdout: "" });
+    });
+
+    test("a broken answer denies with the plain-text reason when the mode is on, and stays silent otherwise", async () => {
       const { port } = await fakeHub({ decision: "allow" });
-      expectAskAgain(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
+      expectUnreachable(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
       expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
       expect(await runQuestion(port, INPUT)).toEqual({ status: 0, stdout: "" });
     });

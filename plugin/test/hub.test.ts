@@ -10,7 +10,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { basename, join } from "path";
 import { z } from "zod";
 import { Hub, MAX_CARDS, projectName } from "../src/hub/hub.ts";
-import { askAgainReason, CANCEL_REASON, SESSION_RESTARTING_REASON } from "../src/hub/questions.ts";
+import { askAgainReason, CANCEL_REASON, NOT_SHOWN_REASON, SESSION_RESTARTING_REASON } from "../src/hub/questions.ts";
 import { RIG_SESSION_LIMIT_MS } from "../src/hub/rig-session.ts";
 import { MAX_MESSAGE } from "../src/shared/chunk.ts";
 import { en } from "../src/shared/i18n/en.ts";
@@ -4180,6 +4180,62 @@ describe("questions", () => {
     expect(edit.text).toBe(`${Q1_TEXT}\n\n${en.pollCancelled}`);
   });
 
+  // A text answer waits in its group for the quiet window. Whatever ends the poll before the group is taken
+  // must hand the group to the agent first, so the owner's words reach it in the order they were sent. The
+  // manual clock keeps the group and the next batch open until the test closes them.
+  describe("a text answer waiting when the poll ends other than by the answer", () => {
+    const inboundTexts = (c: { messages: { type: string }[] }) => c.messages.filter(m => m.type === "inbound").map(m => field(m, "content"));
+    async function openPoll(questions: object[], signal?: AbortSignal) {
+      const clock = newClock();
+      await startHub({ catchUpMs: SHORT_CATCH_UP_MS, timers: clock });
+      const a = await enabled("a");
+      const answer = ask(questions, signal);
+      await a.next("catchUp");
+      await clock.advance(SHORT_CATCH_UP_MS);
+      const msg = await shown();
+      return { clock, a, answer, msg };
+    }
+    const groupWaits = () => waitFor(() => hub.busy().includes("answer groups"), WAIT_MS, "the answer waits in its group");
+    // The owner's next message, once the hub has taken it in: what the agent has got by the time the batch closes.
+    async function sentAfter(clock: Clock, a: Parameters<typeof inboundTexts>[0]): Promise<unknown[]> {
+      say("and then");
+      await updatesHandled();
+      await clock.advance(BATCH_QUIET_MS);
+      await settle();
+      return inboundTexts(a);
+    }
+
+    test("«Cancel» sends the waiting words to the agent before a later message", async () => {
+      const { clock, a, answer, msg } = await openPoll([Q1]);
+      say("my own words");
+      await groupWaits();
+      press(dataOf(msg, 2, 1), fake.lastMessageId);
+      expect(await answer).toEqual({ decision: "deny", reason: CANCEL_REASON });
+      expect(await sentAfter(clock, a)).toEqual(["my own words\n\nand then"]);
+    });
+
+    test("a hook that stops waiting sends them before a later message", async () => {
+      const ctl = new AbortController();
+      const { clock, a, answer } = await openPoll([Q1], ctl.signal);
+      say("my own words");
+      await groupWaits();
+      ctl.abort();
+      await answer;
+      expect(await sentAfter(clock, a)).toEqual(["my own words\n\nand then"]);
+    });
+
+    test("the answer to an earlier question of a poll, ended by a button, goes before a later message", async () => {
+      const { clock, a, msg } = await openPoll([Q1, Q2]);
+      say("my own words");
+      await groupWaits();
+      // The next question is still being sent, so a message sent now is no answer to it.
+      fake.delayNext("sendMessage", SLOW_SEND_MS);
+      press(dataOf(msg, 0), fake.lastMessageId);
+      await waitFor(() => !hub.busy().includes("answer groups"), WAIT_MS, "the group was taken");
+      expect(await sentAfter(clock, a)).toEqual(["my own words\n\nand then"]);
+    });
+  });
+
   test("several questions come one at a time and are answered together", async () => {
     await startHub();
     await enabled("a");
@@ -4671,6 +4727,61 @@ ${en.pollHookEnded}`));
     expect(texts[0]).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
   });
 
+  describe("the warning about a dialog in the terminal asks no supervisor", () => {
+    // What a terminal supervisor leaves for the session (terminal/server.mjs): a descriptor with its pid. Its port
+    // answers nothing here, so a request to the supervisor would fail, as it does for a moment in real life.
+    const record = (pid: number) => JSON.stringify({ schemaVersion: 1, session: "a", generation: "g", pid, childPid: pid, port: 1, token: "0".repeat(64), cwd: CWD });
+    let descriptor: string;
+    const deadPid = (): number => {
+      const finished = Bun.spawnSync([process.execPath, "--version"]);
+      return finished.pid;
+    };
+    async function supervisedWindow(content?: string) {
+      const rigDir = join(dir, "rig");
+      mkdirSync(join(rigDir, "terminals"), { recursive: true });
+      descriptor = join(rigDir, "terminals", "a.json");
+      if (content !== undefined) writeFileSync(descriptor, content);
+      await startHub({ rigDir });
+      return terminalWindow();
+    }
+    // The hub speaks its configured language; the warning is the one message that lists the dialog's question.
+    const warnings = () => sentTexts().filter(t => String(t).includes("• Q?"));
+
+    test("a live supervisor owns the terminal: no warning, even when asking it fails, and the call stays unwarned", async () => {
+      const a = await supervisedWindow(record(process.pid));
+      a.send({ type: "dialog", toolUseId: "d1", questions: ["Q?"] });
+      await settle();
+      expect(warnings()).toEqual([]);
+      expect(hub["warnedDialogs"].get("a")?.has("d1") ?? false).toBe(false);
+      // The supervisor goes away: the same call, reported again, is now warned about, once.
+      writeFileSync(descriptor, record(deadPid()));
+      a.send({ type: "dialog", toolUseId: "d1", questions: ["Q?"] });
+      await waitFor(() => warnings().length === 1, WAIT_MS, "the warning");
+      a.send({ type: "dialog", toolUseId: "d1", questions: ["Q?"] });
+      await settle();
+      expect(warnings().length).toBe(1);
+    });
+
+    test("a descriptor of a dead supervisor is warned about", async () => {
+      const a = await supervisedWindow(record(deadPid()));
+      a.send({ type: "dialog", toolUseId: "d1", questions: ["Q?"] });
+      await waitFor(() => warnings().length === 1, WAIT_MS, "the warning");
+    });
+
+    test("no descriptor means no supervisor: warned about", async () => {
+      const a = await supervisedWindow();
+      a.send({ type: "dialog", toolUseId: "d1", questions: ["Q?"] });
+      await waitFor(() => warnings().length === 1, WAIT_MS, "the warning");
+    });
+
+    test("a descriptor that exists but cannot be read counts as supervised: no warning", async () => {
+      const a = await supervisedWindow("{ being rewrit");
+      a.send({ type: "dialog", toolUseId: "d1", questions: ["Q?"] });
+      await settle();
+      expect(warnings()).toEqual([]);
+    });
+  });
+
   test("turning the mode off moves the poll to the terminal", async () => {
     await startHub();
     const a = await enabled("a");
@@ -4681,7 +4792,9 @@ ${en.pollHookEnded}`));
     await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`));
   });
 
-  test("a poll message Telegram rejects is refused with a request to ask again, and the next poll is shown", async () => {
+  // A rejection that persists repeats on every call and no outside event ends that, so asking again would loop:
+  // the agent is told to write the question as plain text and not to call the tool again for it.
+  test("a poll message Telegram rejects is refused with plain-text advice, not a request to ask again, and the next poll is shown", async () => {
     await startHub();
     await enabled("a");
     fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
@@ -4689,7 +4802,14 @@ ${en.pollHookEnded}`));
     const first = ask([Q1]);
     await queued(1);
     const second = ask([Q3]);
-    expect(await first).toEqual({ decision: "deny", reason: askAgainReason("notShown") });
+    const refused = await first;
+    expect(refused).toEqual({ decision: "deny", reason: NOT_SHOWN_REASON });
+    const reason = (refused as { reason: string }).reason;
+    expect(reason).toContain("Do not call AskUserQuestion again");
+    expect(reason).toContain("plain text");
+    expect(reason).toContain("end your turn");
+    expect(reason).not.toMatch(/ask it again/i);
+    expect(en.pollNotShown).not.toBe(en.pollAskedAgain);
     const msg = await waitFor(() => fake.callsOf("sendMessage").find(c => c.text === Q3_TEXT));
     press(dataOf(msg, 0), fake.lastMessageId);
     expect(await second).toEqual({ decision: "allow", answers: { "Which size?": "Small" } });

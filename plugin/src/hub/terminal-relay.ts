@@ -4,7 +4,9 @@ import { join } from "path";
 import { z } from "zod";
 import type { Entity } from "../shared/markdown.ts";
 import type { Button } from "./telegram.ts";
+import { field } from "../shared/guards.ts";
 import { RIG_QUERY_LIMIT_MS } from "../shared/info-data.ts";
+import { isAlive } from "../shared/process-alive.ts";
 import { realTimers, type Timers } from "../shared/timers.ts";
 
 const snapshotSchema = z.object({ session: z.string(), generation: z.string(), revision: z.number().int().nonnegative(), screen: z.string(), status: z.enum(["starting", "running", "exited"]), recoveries: z.number().int().nonnegative() });
@@ -134,5 +136,19 @@ export class TerminalRelay {
 
   async running(session: string): Promise<boolean> {
     try { return (await this.request(session)).status !== "exited"; } catch { return false; }
+  }
+
+  // Whether a terminal supervisor owns the session: its descriptor exists and the supervisor pid it records is
+  // alive. Synchronous and local, so a transient request failure cannot answer false the way running() does.
+  // A descriptor that exists but cannot be read or understood (being rewritten, locked) counts as supervised:
+  // a false "no supervisor" would warn about a dialog the owner can already see.
+  supervised(session: string): boolean {
+    if (!/^[\w-]{1,128}$/.test(session)) return false;
+    let text: string;
+    try { text = readFileSync(join(this.options.directory, `${session}.json`), "utf8"); } catch (e) { return field(e, "code") !== "ENOENT"; }
+    try {
+      const pid: unknown = field(JSON.parse(text), "pid");
+      return typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0 || isAlive(pid);
+    } catch { return true; }
   }
 }
