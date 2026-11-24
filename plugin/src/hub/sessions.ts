@@ -50,6 +50,17 @@ export function accountOf(configDir: string | undefined, platform: Platform = PL
   return configDir ? platform.pathBase(configDir).match(CSWAP_PROFILE)?.[1] : undefined;
 }
 
+// The persisted Telegram mode of a session, for a process that cannot ask the hub (the question hook with
+// the hub down). Read only: unlike the store, it never moves an unreadable file aside. undefined: the file
+// is missing or unreadable, or has no such session.
+export function readSessionMode(file: string, sessionId: string): boolean | undefined {
+  try {
+    return dataSchema.parse(JSON.parse(readFileSync(file, "utf8")))[sessionId]?.enabled;
+  } catch {
+    return undefined;
+  }
+}
+
 // sessionId → topic. Only the hub writes it; a session keeps its topic forever.
 export class SessionStore {
   private data: Record<string, SessionRecord> = {};

@@ -4,6 +4,11 @@ import type { Entity } from "./markdown.ts";
 
 export const PROTOCOL_VERSION = 1;
 
+// The header with which the hub answers a /question request it has taken as a poll. The response headers go
+// out at once, long before the answer, so a hook that sees the header knows the poll is open in the hub; a
+// hub that does not send it is an older one.
+export const QUESTION_ACCEPTED_HEADER = "x-question-accepted";
+
 // The hub's localhost port unless TELEGRAM_HUB_PORT says otherwise. This file has no
 // imports, so hooks can use it too.
 export const DEFAULT_PORT = 47613;

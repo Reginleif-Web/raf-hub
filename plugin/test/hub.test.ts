@@ -10,7 +10,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { basename, join } from "path";
 import { z } from "zod";
 import { Hub, MAX_CARDS, projectName } from "../src/hub/hub.ts";
-import { CANCEL_REASON } from "../src/hub/questions.ts";
+import { askAgainReason, CANCEL_REASON } from "../src/hub/questions.ts";
 import { RIG_SESSION_LIMIT_MS } from "../src/hub/rig-session.ts";
 import { en } from "../src/shared/i18n/en.ts";
 import { ru } from "../src/shared/i18n/ru.ts";
@@ -18,7 +18,7 @@ import { SessionStore } from "../src/hub/sessions.ts";
 import { saveRuns } from "../src/hub/exec-runs.ts";
 import { TelegramApi } from "../src/hub/telegram.ts";
 import { arr, field } from "../src/shared/guards.ts";
-import { PROTOCOL_VERSION } from "../src/shared/protocol.ts";
+import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER } from "../src/shared/protocol.ts";
 import { toTelegram } from "../src/shared/markdown.ts";
 import { notifies } from "../src/shared/notification.ts";
 import { FakeExec } from "./fake-exec.ts";
@@ -3120,9 +3120,11 @@ describe("holding across session actions", () => {
     await start({ timers: clock, idleMs: 0 });
     const old = await enabled(SID);
     let decided: unknown;
+    let decidedWaiting: unknown;
     hub["polls"].set("poll", {
       key: "poll",
       sessionId: SID,
+      started: true,
       questions: [],
       answers: {},
       index: 0,
@@ -3135,10 +3137,28 @@ describe("holding across session actions", () => {
         decided = decision;
       },
     });
+    // A second poll of the session that still waits unseen ends with the first one.
+    hub["polls"].set("waiting", {
+      key: "waiting",
+      sessionId: SID,
+      started: false,
+      questions: [],
+      answers: {},
+      index: 0,
+      checked: new Set(),
+      messageIds: [],
+      outcomes: [],
+      taken: [],
+      done: false,
+      resolve: decision => {
+        decidedWaiting = decision;
+      },
+    });
     fake.pushUpdate(msg("/stop"));
     await stopStarted();
-    await waitFor(() => decided !== undefined, WAIT_MS, "the poll ended");
+    await waitFor(() => decided !== undefined && decidedWaiting !== undefined, WAIT_MS, "the polls ended");
     expect(decided).toEqual({ decision: "none" });
+    expect(decidedWaiting).toEqual({ decision: "none" });
     fake.pushUpdate(msg("typed answer"));
     await updatesHandled();
     gated.release();
@@ -3818,14 +3838,28 @@ describe("questions", () => {
     ],
     multiSelect: true,
   };
-  const ask = (questions: object[], signal?: AbortSignal): Promise<unknown> =>
+  const Q3 = {
+    question: "Which size?",
+    header: "Size",
+    options: [
+      { label: "Small", description: "" },
+      { label: "Large", description: "" },
+    ],
+    multiSelect: false,
+  };
+  const Q3_TEXT = "Size\nWhich size?\n\n1. Small\n2. Large";
+  const Q2_TEXT = "Extras\nWhat to add?\n\n1. Cheese\n2. Onion\n3. Pepper";
+  const askAs = (sessionId: string, questions: object[], signal?: AbortSignal): Promise<unknown> =>
     fetch(`http://127.0.0.1:${port}/question`, {
       method: "POST",
-      body: JSON.stringify({ messagingSocket: "win-a", session_id: "a", tool_input: { questions } }),
+      body: JSON.stringify({ messagingSocket: `win-${sessionId}`, session_id: sessionId, tool_input: { questions } }),
       ...(signal ? { signal } : {}),
     })
       .then(r => r.json())
       .catch((e: unknown) => String(e));
+  const ask = (questions: object[], signal?: AbortSignal): Promise<unknown> => askAs("a", questions, signal);
+  const moved = (text: string) => `${text}\n\n${en.pollMovedToTerminal}`;
+  const sentTexts = () => fake.callsOf("sendMessage").map(c => c.text);
   const rows = (params: unknown) => arr(field(field(params, "reply_markup"), "inline_keyboard")).map(arr);
   const keys = (params: unknown) => rows(params).map(r => r.map(b => field(b, "text")));
   const dataOf = (params: unknown, row: number, col = 0) => String(field(rows(params)[row][col], "callback_data"));
@@ -4130,7 +4164,7 @@ describe("questions", () => {
     expect(fake.callsOf("sendMessage")).toEqual([]);
   });
 
-  test("a hook that stops waiting moves the poll to the terminal", async () => {
+  test("a hook that stops waiting tells the owner where the question may be waiting", async () => {
     await startHub();
     await enabled("a");
     const ctl = new AbortController();
@@ -4138,31 +4172,300 @@ describe("questions", () => {
     await polled();
     ctl.abort();
     await answer;
-    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`));
+    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollHookEnded}`));
   });
 
-  test("a new poll of the session closes the old one", async () => {
+  // The hook learns at once that the poll is accepted: the headers go out before the answer, and the body
+  // starts with a blank that a JSON parser skips, so a hook that knows nothing of it still reads the answer.
+  const rawAsk = (questions: object[], signal?: AbortSignal) =>
+    fetch(`http://127.0.0.1:${port}/question`, {
+      method: "POST",
+      body: JSON.stringify({ messagingSocket: "win-a", session_id: "a", tool_input: { questions } }),
+      ...(signal ? { signal } : {}),
+    });
+
+  test("the hub announces the accepted poll before the answer, and the answer stays plain JSON", async () => {
     await startHub();
     await enabled("a");
-    const old = ask([Q1]);
-    await polled();
-    const fresh = ask([Q2]);
-    expect(await old).toEqual({ decision: "none" });
-    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`));
-    const msg = await polled(2);
+    const state = { headers: false };
+    const response = rawAsk([Q1]).then(r => {
+      state.headers = true;
+      return r;
+    });
+    const msg = await polled();
+    await settle();
+    expect(state.headers).toBe(true);
     press(dataOf(msg, 0), fake.lastMessageId);
-    press(dataOf(msg, 3), fake.lastMessageId);
-    expect(await fresh).toEqual({ decision: "allow", answers: { "What to add?": "Cheese" } });
+    const r = await response;
+    expect(r.headers.get(QUESTION_ACCEPTED_HEADER)).toBe("1");
+    const text = await r.text();
+    expect(text.startsWith(" ")).toBe(true);
+    expect(JSON.parse(text)).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
   });
 
-  test("a stopping hub moves the poll to the terminal", async () => {
+  test("a hook that aborts after the acceptance still ends the poll in the hub", async () => {
     await startHub();
     await enabled("a");
-    const answer = ask([Q1]);
+    const ctl = new AbortController();
+    const response = rawAsk([Q1], ctl.signal);
     await polled();
+    expect((await response).headers.get(QUESTION_ACCEPTED_HEADER)).toBe("1");
+    ctl.abort();
+    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollHookEnded}`));
+  });
+
+  test("a refusal of the poll carries no acceptance header", async () => {
+    await startHub();
+    const a = await enabled("a");
+    await req(a, { op: "disable" });
+    const r = await rawAsk([Q1]);
+    expect(r.headers.get(QUESTION_ACCEPTED_HEADER)).toBeNull();
+    expect(await r.json()).toEqual({ decision: "none" });
+  });
+
+  test("the owner texts about a poll that moved to the terminal point at /terminal", () => {
+    for (const m of [en, ru]) {
+      expect(m.pollHookEnded).toContain("/terminal");
+      expect(m.pollMovedToTerminal).toContain("/terminal");
+    }
+  });
+
+  // An agent may call AskUserQuestion twice in one step, so polls of one session queue: only the first is
+  // shown, the rest wait unseen, and every answer belongs to exactly one call.
+  const queued = (n: number) => waitFor(() => hub["polls"].size === n, WAIT_MS, `${n} open polls`);
+  const pending = (p: Promise<unknown>) => {
+    const state = { settled: false };
+    void p.then(() => (state.settled = true));
+    return state;
+  };
+
+  test("a second poll of the session waits unseen until the first ends, and each answer goes to its own call", async () => {
+    await startHub();
+    await enabled("a");
+    const first = ask([Q1]);
+    const msg = await shown();
+    const second = ask([Q2]);
+    await queued(2);
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+    const waiting = pending(second);
+    press(dataOf(msg, 1), fake.lastMessageId);
+    expect(await first).toEqual({ decision: "allow", answers: { "Which color?": "Blue" } });
+    const next = await polled(2);
+    expect(waiting.settled).toBe(false);
+    expect(sentTexts()).toEqual([Q1_TEXT, Q2_TEXT]);
+    press(dataOf(next, 0), fake.lastMessageId);
+    press(dataOf(next, 3), fake.lastMessageId);
+    expect(await second).toEqual({ decision: "allow", answers: { "What to add?": "Cheese" } });
+  });
+
+  test("three polls of a session are shown one after another in the order they came", async () => {
+    await startHub();
+    await enabled("a");
+    const first = ask([Q1]);
+    const one = await shown();
+    const second = ask([Q3]);
+    await queued(2);
+    const third = ask([Q2]);
+    await queued(3);
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+    press(dataOf(one, 0), fake.lastMessageId);
+    expect(await first).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+    const two = await polled(2);
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT, Q3_TEXT]);
+    press(dataOf(two, 1), fake.lastMessageId);
+    expect(await second).toEqual({ decision: "allow", answers: { "Which size?": "Large" } });
+    const three = await polled(3);
+    expect(sentTexts()).toEqual([Q1_TEXT, Q3_TEXT, Q2_TEXT]);
+    press(dataOf(three, 1), fake.lastMessageId);
+    press(dataOf(three, 3), fake.lastMessageId);
+    expect(await third).toEqual({ decision: "allow", answers: { "What to add?": "Onion" } });
+  });
+
+  test("a waiting poll whose hook gives up is never shown and does not disturb the others", async () => {
+    await startHub();
+    await enabled("a");
+    const first = ask([Q1]);
+    const one = await shown();
+    const ctl = new AbortController();
+    const second = ask([Q2], ctl.signal);
+    await queued(2);
+    const third = ask([Q3]);
+    await queued(3);
+    ctl.abort();
+    expect(await second).toContain("Abort");
+    await queued(2);
+    press(dataOf(one, 0), fake.lastMessageId);
+    expect(await first).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+    const two = await polled(2);
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT, Q3_TEXT]);
+    press(dataOf(two, 0), fake.lastMessageId);
+    expect(await third).toEqual({ decision: "allow", answers: { "Which size?": "Small" } });
+    expect(edits().some(e => String(e.text).startsWith("Extras"))).toBe(false);
+  });
+
+  test("when the hook of the shown poll gives up, the next poll is shown", async () => {
+    await startHub();
+    await enabled("a");
+    const ctl = new AbortController();
+    const first = ask([Q1], ctl.signal);
+    await shown();
+    const second = ask([Q3]);
+    await queued(2);
+    ctl.abort();
+    await first;
+    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}
+
+${en.pollHookEnded}`));
+    const next = await polled(2);
+    expect(next.text).toBe(Q3_TEXT);
+    press(dataOf(next, 1), fake.lastMessageId);
+    expect(await second).toEqual({ decision: "allow", answers: { "Which size?": "Large" } });
+  });
+
+  test("a message that answers goes to the shown poll only", async () => {
+    await startHub();
+    const a = await enabled("a");
+    const first = ask([Q1]);
+    await shown();
+    const second = ask([Q3]);
+    await queued(2);
+    const waiting = pending(second);
+    say("mine");
+    expect(await first).toEqual({ decision: "allow", answers: { "Which color?": "mine" } });
+    const next = await polled(2);
+    await settle();
+    expect(waiting.settled).toBe(false);
+    expect(a.messages.filter(m => m.type === "inbound")).toEqual([]);
+    press(dataOf(next, 0), fake.lastMessageId);
+    expect(await second).toEqual({ decision: "allow", answers: { "Which size?": "Small" } });
+  });
+
+  test("a press delivered twice answers once and never the next poll", async () => {
+    await startHub();
+    await enabled("a");
+    const first = ask([Q1]);
+    const msg = await shown();
+    const id = fake.lastMessageId;
+    const second = ask([Q3]);
+    await queued(2);
+    const waiting = pending(second);
+    press(dataOf(msg, 0), id);
+    press(dataOf(msg, 0), id);
+    expect(await first).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+    await waitFor(() => fake.callsOf("answerCallbackQuery").some(c => c.text === en.pollStale));
+    await polled(2);
+    await settle();
+    expect(waiting.settled).toBe(false);
+    expect(sentTexts()).toEqual([Q1_TEXT, Q3_TEXT]);
+  });
+
+  test("«Cancel» denies the shown poll and every waiting one of the session", async () => {
+    await startHub();
+    await enabled("a");
+    const first = ask([Q1]);
+    const msg = await shown();
+    const second = ask([Q2]);
+    await queued(2);
+    const third = ask([Q3]);
+    await queued(3);
+    press(dataOf(msg, 2, 1), fake.lastMessageId);
+    expect(await first).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    expect(await second).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    expect(await third).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+  });
+
+  test('a "!" message denies the shown poll and every waiting one, and reaches the agent once', async () => {
+    await startHub();
+    const a = await enabled("a");
+    const first = ask([Q1]);
+    await shown();
+    const second = ask([Q2]);
+    await queued(2);
+    const arrived = a.nextNew("inbound");
+    say("!stop");
+    expect(await first).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    expect(await second).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    expect(await arrived).toMatchObject({ content: "stop" });
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+    expect(a.messages.filter(m => m.type === "inbound")).toHaveLength(1);
+  });
+
+  test("turning the mode off moves every poll of the session to the terminal", async () => {
+    await startHub();
+    const a = await enabled("a");
+    const first = ask([Q1]);
+    await shown();
+    const second = ask([Q2]);
+    await queued(2);
+    await req(a, { op: "disable" });
+    expect(await first).toEqual({ decision: "none" });
+    expect(await second).toEqual({ decision: "none" });
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+    expect(edits().some(e => e.text === moved(Q1_TEXT))).toBe(true);
+  });
+
+  test("a window that goes away has every poll of the session closed with a request to ask again", async () => {
+    await startHub();
+    const a = await enabled("a");
+    const first = ask([Q1]);
+    await shown();
+    const second = ask([Q2]);
+    await queued(2);
+    a.close();
+    expect(await first).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
+    expect(await second).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
+    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`));
+    await settle();
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+  });
+
+  test("a stopping hub closes every poll with a request to ask again, the waiting ones too", async () => {
+    await startHub();
+    await enabled("a");
+    const first = ask([Q1]);
+    await shown();
+    const second = ask([Q2]);
+    await queued(2);
     await hub.stop();
-    expect(await answer).toEqual({ decision: "none" });
-    expect(edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`)).toBe(true);
+    expect(await first).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+    expect(await second).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+    expect(edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`)).toBe(true);
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+  });
+
+  test("polls of two sessions are served at the same time, each by its own queue", async () => {
+    await startHub();
+    await enabled("a");
+    await enabled("b");
+    const a1 = askAs("a", [Q1]);
+    const b1 = askAs("b", [Q3]);
+    await waitFor(() => sentTexts().length === 2);
+    const a2 = askAs("a", [Q2]);
+    await queued(3);
+    await settle();
+    expect(sentTexts().sort()).toEqual([Q1_TEXT, Q3_TEXT].sort());
+    // The hub looks a poll up by the key in the button, not by the message id, so any id will do here.
+    const id = fake.lastMessageId;
+    const bMsg = must(fake.callsOf("sendMessage").find(c => c.text === Q3_TEXT));
+    press(dataOf(bMsg, 1), id);
+    expect(await b1).toEqual({ decision: "allow", answers: { "Which size?": "Large" } });
+    await settle();
+    expect(sentTexts()).toHaveLength(2);
+    const aMsg = must(fake.callsOf("sendMessage").find(c => c.text === Q1_TEXT));
+    press(dataOf(aMsg, 0), id);
+    expect(await a1).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+    const next = await waitFor(() => fake.callsOf("sendMessage").find(c => c.text === Q2_TEXT));
+    press(dataOf(next, 1), fake.lastMessageId);
+    press(dataOf(next, 3), fake.lastMessageId);
+    expect(await a2).toEqual({ decision: "allow", answers: { "What to add?": "Onion" } });
   });
 
   test("a hub that stops while the poll is still being sent has moved it to the terminal when stop returns", async () => {
@@ -4175,18 +4478,18 @@ describe("questions", () => {
     // stop() runs on microtasks up to the question send it has to wait for; the held response needs network I/O, so it comes later.
     release();
     await stopping;
-    expect(edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`)).toBe(true);
-    expect(await answer).toEqual({ decision: "none" });
+    expect(edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`)).toBe(true);
+    expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
   });
 
-  test("a window that goes away moves its poll to the terminal", async () => {
+  test("a window that goes away has its poll closed with a request to ask again", async () => {
     await startHub();
     const a = await enabled("a");
     const answer = ask([Q1]);
     await polled();
     a.close();
-    expect(await answer).toEqual({ decision: "none" });
-    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`));
+    expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
+    await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`));
   });
 
   test("turning the mode off moves the poll to the terminal", async () => {
@@ -4199,12 +4502,18 @@ describe("questions", () => {
     await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollMovedToTerminal}`));
   });
 
-  test("a poll message Telegram rejects leaves the question to the terminal", async () => {
+  test("a poll message Telegram rejects is refused with a request to ask again, and the next poll is shown", async () => {
     await startHub();
     await enabled("a");
     fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
     fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
-    expect(await ask([Q1])).toEqual({ decision: "none" });
+    const first = ask([Q1]);
+    await queued(1);
+    const second = ask([Q3]);
+    expect(await first).toEqual({ decision: "deny", reason: askAgainReason("notShown") });
+    const msg = await waitFor(() => fake.callsOf("sendMessage").find(c => c.text === Q3_TEXT));
+    press(dataOf(msg, 0), fake.lastMessageId);
+    expect(await second).toEqual({ decision: "allow", answers: { "Which size?": "Small" } });
   });
 
   test("a body that is not a question is refused", async () => {

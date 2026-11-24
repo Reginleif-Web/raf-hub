@@ -66,7 +66,9 @@ export const en = {
   pollStale: "The poll is outdated",
   pollPickOne: "Pick at least one option",
   pollCancelled: "✖️ Poll cancelled",
-  pollMovedToTerminal: "⌛ The poll was moved to the terminal",
+  pollMovedToTerminal: "⌛ The poll was moved to the terminal (/terminal shows it here)",
+  pollAskedAgain: "↩️ The poll was closed; the agent was asked to ask it again",
+  pollHookEnded: "⌛ The poll ended on the terminal side (Esc, the time limit or a restart). If the agent still waits for an answer, it may be a dialog in the terminal: /terminal shows it here, or answer it there",
   pollHead: ({ index, total, header }: { index: number; total: number; header: string | undefined }) =>
     total > 1 ? `Question ${index} of ${total}${header ? `: ${header}` : ""}` : header ?? "",
   pollDone: "✅ Done",

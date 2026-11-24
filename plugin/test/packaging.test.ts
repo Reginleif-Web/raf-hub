@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "child_process";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { join, resolve } from "path";
 import { PLATFORM } from "../src/shared/platform.ts";
 import { z } from "zod";
@@ -26,6 +26,8 @@ const PARENT_GONE_TEST_MS = 30_000;
 // Starts the hook with its own stdin, prints its pid and lives on until killed.
 // Detached, so the hook outlives it, as it would outlive a dead Claude Code.
 const PARENT_SCRIPT = "const c = require(\"child_process\").spawn(process.execPath, [process.env.HOOK_PATH], { stdio: [\"inherit\", \"ignore\", \"ignore\"], detached: true, windowsHide: true }); console.log(c.pid); await Bun.sleep(1e9);";
+// The same, with the hook's stdout going to the file OUT_PATH, to see whether the hook printed anything.
+const PARENT_SCRIPT_TO_FILE = "const fd = require(\"fs\").openSync(process.env.OUT_PATH, \"w\"); const c = require(\"child_process\").spawn(process.execPath, [process.env.HOOK_PATH], { stdio: [\"inherit\", fd, \"ignore\"], detached: true, windowsHide: true }); console.log(c.pid); await Bun.sleep(1e9);";
 
 // Async on purpose: an in-process hub must keep serving while the hook runs.
 async function runHook(port: number, input: object, socket = "pipe-H") {
@@ -187,15 +189,102 @@ describe("AskUserQuestion hook", () => {
     hub = undefined;
   });
 
-  async function runQuestion(port: number, input: object) {
+  // The hook reads the persisted mode of the session from its state dir when the hub is unreachable, so every
+  // run gets an empty state dir of its own (never the real one) unless the test gives one.
+  async function runQuestion(port: number, input: object, extraEnv: Record<string, string> = {}) {
     const proc = Bun.spawn([process.execPath, QUESTION_HOOK], {
       stdin: new Blob([JSON.stringify(input)]),
       stdout: "pipe",
-      env: { ...process.env, TELEGRAM_HUB_PORT: String(port), CLAUDE_CODE_MESSAGING_SOCKET: "pipe-Q" },
+      env: { ...process.env, TELEGRAM_HUB_STATE_DIR: tempDir(), TELEGRAM_HUB_PORT: String(port), CLAUDE_CODE_MESSAGING_SOCKET: "pipe-Q", ...extraEnv },
       windowsHide: true,
     });
     const stdout = await new Response(proc.stdout).text();
     return { status: await proc.exited, stdout };
+  }
+
+  // A state dir whose sessions.json says whether Telegram mode of session "s" is on.
+  function stateWithMode(enabled: boolean): string {
+    const dir = tempDir();
+    writeFileSync(join(dir, "sessions.json"), JSON.stringify({ s: { title: "t", project: "p", enabled } }));
+    return dir;
+  }
+
+  // The deny the hook prints, as the agent sees it.
+  const denyOf = (stdout: string) => {
+    const out = JSON.parse(stdout).hookSpecificOutput;
+    expect(out.hookEventName).toBe("PreToolUse");
+    expect(out.permissionDecision).toBe("deny");
+    return String(out.permissionDecisionReason);
+  };
+  // What every deny that says "the question was not answered" must tell the agent.
+  const expectAskAgain = (reason: string) => {
+    expect(reason).toContain("Nothing was answered");
+    expect(reason).toContain("nothing was asked in the terminal");
+    expect(reason).toContain("single AskUserQuestion call");
+  };
+  const expectUnreachable = (reason: string) => {
+    expect(reason).toContain("unreachable");
+    expect(reason).toContain("plain text");
+    expect(reason).toContain("end your turn");
+    expect(reason).toContain("Do not");
+  };
+
+  // A stand-in for a hub that has accepted the poll: the acceptance header and a first chunk go at once; what
+  // comes after is up to the test. "drop" breaks the response mid-body, as a killed hub does.
+  async function acceptingHub(after: "drop" | "garbage" | "hold" | "none" | "allow") {
+    const port = await freePort();
+    const seen = { got: 0, aborted: 0 };
+    const enc = new TextEncoder();
+    if (after === "drop") {
+      // Raw HTTP, so the break comes at a fixed point and needs no timer: the headers and one chunk of a
+      // chunked body go out, then the socket closes without the terminating chunk.
+      let answered = false;
+      server = Bun.listen({
+        hostname: "127.0.0.1",
+        port,
+        socket: {
+          data(socket) {
+            if (answered) return;
+            answered = true;
+            seen.got++;
+            socket.write("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-question-accepted: 1\r\ntransfer-encoding: chunked\r\n\r\n1\r\n \r\n");
+            socket.end();
+          },
+          open() {},
+          close() {},
+          error() {},
+        },
+      });
+      return { port, seen };
+    }
+    server = Bun.serve({
+      port,
+      hostname: "127.0.0.1",
+      fetch(req, srv) {
+        srv.timeout(req, 0);
+        seen.got++;
+        req.signal.addEventListener("abort", () => seen.aborted++);
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode(" "));
+            if (after === "garbage") {
+              c.enqueue(enc.encode("not json"));
+              c.close();
+            }
+            if (after === "none") {
+              c.enqueue(enc.encode(JSON.stringify({ decision: "none" })));
+              c.close();
+            }
+            if (after === "allow") {
+              c.enqueue(enc.encode(JSON.stringify({ decision: "allow", answers: { q: "a" } })));
+              c.close();
+            }
+          },
+        });
+        return new Response(body, { headers: { "content-type": "application/json", "x-question-accepted": "1" } });
+      },
+    });
+    return { port, seen };
   }
 
   // A stand-in hub that answers /question with the given decision and keeps the bodies it got.
@@ -350,6 +439,130 @@ describe("AskUserQuestion hook", () => {
     const r = spawnSync(process.execPath, [QUESTION_HOOK], { input: "not json", env: { ...process.env, TELEGRAM_HUB_PORT: String(port) }, encoding: "utf8", windowsHide: true });
     expect(r.status).toBe(0);
     expect(r.stdout).toBe("");
+  });
+
+  // Once the hub has accepted the poll the owner may be away, so a silent terminal dialog would block the
+  // session: every technical end of the wait is a deny that tells the agent to ask again.
+  describe("after the hub accepted the poll", () => {
+    test("an answer still arrives after the first chunk", async () => {
+      const { port } = await acceptingHub("allow");
+      const r = await runQuestion(port, INPUT);
+      expect(JSON.parse(r.stdout).hookSpecificOutput).toMatchObject({ permissionDecision: "allow", updatedInput: { answers: { q: "a" } } });
+    });
+
+    test("a connection lost while waiting denies with the ask-again reason", async () => {
+      const { port } = await acceptingHub("drop");
+      const r = await runQuestion(port, INPUT);
+      expect(r.status).toBe(0);
+      expectAskAgain(denyOf(r.stdout));
+    });
+
+    test("an unreadable answer denies with the ask-again reason", async () => {
+      const { port } = await acceptingHub("garbage");
+      const r = await runQuestion(port, INPUT);
+      expect(r.status).toBe(0);
+      expectAskAgain(denyOf(r.stdout));
+    });
+
+    test("the hook's own time limit denies with the ask-again reason and ends the poll in the hub", async () => {
+      const { port, seen } = await acceptingHub("hold");
+      const r = await runQuestion(port, INPUT, { TELEGRAM_HUB_QUESTION_DEADLINE_MS: String(TEST_DEADLINE_MS) });
+      expect(r.status).toBe(0);
+      expectAskAgain(denyOf(r.stdout));
+      await waitFor(() => seen.aborted === 1);
+    });
+
+    test("an explicit none from the hub still leaves the dialog to the terminal", async () => {
+      const { port } = await acceptingHub("none");
+      expect(await runQuestion(port, INPUT)).toEqual({ status: 0, stdout: "" });
+    });
+
+    test("the parent gone is silent, the poll still ends in the hub", async () => {
+      const { port, seen } = await acceptingHub("hold");
+      const out = join(tempDir(), "hook-stdout.txt");
+      const parent = Bun.spawn([process.execPath, "-e", PARENT_SCRIPT_TO_FILE], {
+        stdin: new Blob([JSON.stringify(INPUT)]),
+        stdout: "pipe",
+        env: { ...process.env, TELEGRAM_HUB_STATE_DIR: tempDir(), TELEGRAM_HUB_PORT: String(port), HOOK_PATH: QUESTION_HOOK, OUT_PATH: out },
+        windowsHide: true,
+      });
+      const reader = parent.stdout.getReader();
+      const hookPid = Number(new TextDecoder().decode((await reader.read()).value).trim());
+      try {
+        await waitFor(() => seen.got === 1);
+        parent.kill();
+        await parent.exited;
+        await waitFor(() => seen.aborted === 1, PARENT_GONE_WAIT_MS);
+        await waitFor(() => !isAlive(hookPid), PARENT_GONE_WAIT_MS);
+        expect(readFileSync(out, "utf8")).toBe("");
+      } finally {
+        if (isAlive(hookPid)) process.kill(hookPid);
+      }
+    }, PARENT_GONE_TEST_MS);
+  });
+
+  // An old hub sends no acceptance header: the hook must act as it always did.
+  describe("with a hub that does not announce acceptance", () => {
+    test("a broken answer, none and a held request until the limit stay silent, even with the mode on", async () => {
+      const state = stateWithMode(true);
+      for (const decision of [{ decision: "none" }, { decision: "allow" }]) {
+        const { port } = await fakeHub(decision);
+        expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: state })).toEqual({ status: 0, stdout: "" });
+        server?.stop(true);
+      }
+      const { port } = await holdingHub();
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: state, TELEGRAM_HUB_QUESTION_DEADLINE_MS: String(TEST_DEADLINE_MS) })).toEqual({ status: 0, stdout: "" });
+    });
+
+    test("an answer from an old hub is read as before", async () => {
+      const { port } = await fakeHub({ decision: "deny", reason: "cancelled" });
+      expect(denyOf((await runQuestion(port, INPUT)).stdout)).toBe("cancelled");
+    });
+  });
+
+  // The hub cannot be reached at all: whether the owner is waiting in Telegram is in the persisted mode.
+  describe("when the hub is unreachable", () => {
+    test("with the mode on it denies and tells the agent to write the question as plain text", async () => {
+      const r = await runQuestion(await freePort(), INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) });
+      expect(r.status).toBe(0);
+      expectUnreachable(denyOf(r.stdout));
+    });
+
+    test("a hub that took the connection and closed it before accepting counts as unreachable", async () => {
+      const port = await freePort();
+      const listener = Bun.listen({ hostname: "127.0.0.1", port, socket: { data: s => void s.end(), open() {}, close() {}, error() {} } });
+      try {
+        const r = await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) });
+        expectUnreachable(denyOf(r.stdout));
+      } finally {
+        listener.stop(true);
+      }
+    });
+
+    test("a hub that answers with an error status denies with the mode on and stays silent with it off", async () => {
+      const port = await freePort();
+      server = Bun.serve({ port, hostname: "127.0.0.1", fetch: () => new Response("broken", { status: 500 }) });
+      expectUnreachable(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
+      expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
+    });
+
+    test("with the mode off, a missing file or a session the file does not know it stays silent", async () => {
+      const port = await freePort();
+      const unknown = tempDir();
+      writeFileSync(join(unknown, "sessions.json"), JSON.stringify({ other: { title: "t", project: "p", enabled: true } }));
+      for (const dir of [stateWithMode(false), tempDir(), unknown]) {
+        expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: dir })).toEqual({ status: 0, stdout: "" });
+      }
+    });
+
+    test("an unreadable sessions file stays silent and is left exactly as it was", async () => {
+      const dir = tempDir();
+      const file = join(dir, "sessions.json");
+      writeFileSync(file, "{ not json");
+      expect(await runQuestion(await freePort(), INPUT, { TELEGRAM_HUB_STATE_DIR: dir })).toEqual({ status: 0, stdout: "" });
+      expect(readFileSync(file, "utf8")).toBe("{ not json");
+      expect(readdirSync(dir)).toEqual(["sessions.json"]);
+    });
   });
 });
 

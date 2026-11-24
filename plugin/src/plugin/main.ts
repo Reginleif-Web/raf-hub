@@ -33,7 +33,7 @@ const INSTRUCTIONS = [
   "",
   "Whether the last text of a turn comes with a notification, and whether the terminal plays a sound, is decided automatically when the turn ends. Do not call anything for it and do not mention it: just write your answer.",
   "",
-  "While the mode is on, AskUserQuestion is asked in the topic, and text you write in the same step as the AskUserQuestion call reaches the topic only after the user answers. To explain something before asking, write the explanation, call tg_before_question, and call AskUserQuestion in the next step, not in the same one.",
+  "While the mode is on, AskUserQuestion is asked in the topic, and text you write in the same step as the AskUserQuestion call reaches the topic only after the user answers. To explain something before asking, write the explanation, call tg_before_question, and call AskUserQuestion in the next step, not in the same one. Make one AskUserQuestion call per step: put every question of that step into that one call (it takes several), never several calls in parallel.",
   "",
   "To show the user a file in Telegram — a screenshot, a chart, a log — call tg_send_file with its path; several paths make an album. Text you wrote before the call arrives first. It works whenever the session has a topic, even with the mode off, so you can send a file the user asked for from the terminal.",
   "",

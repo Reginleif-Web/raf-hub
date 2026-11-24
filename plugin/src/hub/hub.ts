@@ -32,7 +32,7 @@ import { field } from "../shared/guards.ts";
 import { catalogOf, DEFAULT_LANGUAGE } from "../shared/i18n/index.ts";
 import { literal, toTelegram } from "../shared/markdown.ts";
 import { albums, kindOf } from "../shared/media.ts";
-import { PROTOCOL_VERSION } from "../shared/protocol.ts";
+import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER } from "../shared/protocol.ts";
 import { hookBody, pluginToHub, questionBody, sendFilesMessage, sendMessage, turnEndBody, turnFailedBody } from "../shared/protocol-schema.ts";
 import { loadCards, saveCards } from "./cards.ts";
 import { loadPollOffset, savePollOffset } from "./poll-offset.ts";
@@ -48,7 +48,7 @@ import { accountOf, SessionStore, topicName } from "./sessions.ts";
 import { isThreadNotFound, TelegramError } from "./telegram.ts";
 import { media, richPhotos, richToMarkdown } from "./rich.ts";
 import { withContext } from "./reply-context.ts";
-import { answerLine, CANCEL_REASON, checkedLabels, parsePollPress, POLL_PREFIX, questionButtons, questionText, withOutcome } from "./questions.ts";
+import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, parsePollPress, POLL_PREFIX, questionButtons, questionText, withOutcome } from "./questions.ts";
 import { richPieces } from "./rich-out.ts";
 import { DEFAULT_VIDEO_TOOLS, probeVideo, thumbPath } from "./video.ts";
 import { EXEC_CARD_MS, EXEC_CHECK_MS, EXEC_MAX_AGE_MS, Execs } from "./exec.ts";
@@ -308,7 +308,8 @@ export class Hub {
   private registeringCommands: Promise<void> | undefined;
   // Permission prompts sent to topics, by the key in their buttons' data.
   private permissions = new Map<string, { sessionId: string; requestId: string; settled?: boolean } & Formatted>();
-  // Open AskUserQuestion polls, by the key in their buttons' data; one per session.
+  // Open AskUserQuestion polls, by the key in their buttons' data; in the order they came, so the first of a
+  // session is the shown one and the rest wait unseen.
   private polls = new Map<string, Poll>();
   // Questions waiting for their window to catch up, by poll key.
   private catchUps = new Map<string, () => void>();
@@ -559,8 +560,10 @@ export class Hub {
       await Promise.all([...this.batches.keys(), ...this.batchSends.keys()].map(sid => this.flushBatch(sid)));
     }
     this.batchIds.clear();
-    // Open polls go back to the terminal, which the next hub cannot answer.
-    await Promise.allSettled([...this.polls.values()].map(p => this.finishPoll(p, { decision: "none" }, this.m().pollMovedToTerminal)));
+    // The next hub cannot answer an open poll, and a terminal dialog the owner cannot see must not open:
+    // every poll is refused with a request to ask again, the waiting ones too.
+    const refusal: QuestionDecision = { decision: "deny", reason: askAgainReason("hubStopping") };
+    await Promise.allSettled([...new Set([...this.polls.values()].map(p => p.sessionId))].map(sid => this.endPolls(sid, refusal, this.m().pollAskedAgain).settled));
     // A question still being sent shows the outcome right after its send.
     await Promise.allSettled([...this.questionSends]);
     if (this.idleTimer) this.clearTimer(this.idleTimer);
@@ -629,10 +632,27 @@ export class Hub {
       let target: WS | undefined;
       for (const ws of this.conns) if (messagingSocket !== undefined && ws.data.windowKey === messagingSocket) target = ws;
       const sessionId = (target ?? this.connOf(hookSession))?.data.sessionId ?? hookSession;
-      if (!this.store.get(sessionId)?.enabled) return Response.json({ decision: "none" });
+      if (!this.store.get(sessionId)?.enabled || this.isStarting(sessionId)) return Response.json({ decision: "none" });
       // The answer may take hours; the hook's own timeout bounds the wait.
       server.timeout(req, 0);
-      return Response.json(await this.askQuestion(sessionId, tool_input.questions, req.signal));
+      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal);
+      // The poll is accepted: the headers and a first blank chunk go out at once (a response streamed from
+      // a ReadableStream sends its headers with the first chunk), so the hook knows the poll is open. The
+      // decision follows as JSON; JSON.parse skips the leading blank, so a hook that does not look at the
+      // header reads the body as before.
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start: controller => {
+          controller.enqueue(encoder.encode(" "));
+          void decision.then(d => {
+            try {
+              controller.enqueue(encoder.encode(JSON.stringify(d)));
+              controller.close();
+            } catch {} // the hook went away and the stream is closed already
+          });
+        },
+      });
+      return new Response(body, { headers: { "content-type": "application/json", [QUESTION_ACCEPTED_HEADER]: "1" } });
     }
     return new Response("not found", { status: 404 });
   }
@@ -700,9 +720,7 @@ export class Hub {
     if (!this.running) return;
     if (sid) this.log.info(`window for session ${sid} disconnected`);
     // Without its window the session cannot take an answer any more.
-    if (sid && !this.connOf(sid)) {
-      for (const p of this.polls.values()) if (p.sessionId === sid) this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollMovedToTerminal));
-    }
+    if (sid && !this.connOf(sid)) this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
     // The window a stop or a cleanup ended is gone: what was held meanwhile goes the way a new topic message would.
     const closing = [...this.launches].filter(([launchSid, l]) => l.ending?.closing && this.endingSettled(launchSid, l.old));
     for (const [launchSid, l] of closing) this.finishEnding(launchSid, l);
@@ -1016,7 +1034,7 @@ ${msg.text}`);
     this.store.setEnabled(sessionId, on, byUser);
     this.pushState(sessionId);
     // With the mode off the user answers in the terminal, as on a timeout.
-    if (!on) for (const p of this.polls.values()) if (p.sessionId === sessionId) this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollMovedToTerminal));
+    if (!on) this.endPolls(sessionId, { decision: "none" }, this.m().pollMovedToTerminal);
     return on;
   }
 
@@ -1074,25 +1092,50 @@ ${msg.text}`);
 
   // An AskUserQuestion call from the PreToolUse hook: the questions go to the
   // topic one at a time, and the promise settles with the topic's answer, or
-  // with "none" when the call goes back to the terminal (the hook gave up,
-  // the window left, the hub stops). A newer poll of the session ends the old one.
+  // with "none" when the call goes back to the terminal (the owner turned the
+  // mode off, the hook gave up, the session ends), or with a deny when the
+  // topic cannot take it (see askAgainReason). The agent can call
+  // AskUserQuestion again while an earlier call still waits, so polls of one
+  // session are served one after another: a later one waits unseen until the
+  // earlier one ends, and an older poll is never ended by a newer one.
   private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal): Promise<QuestionDecision> {
-    if (this.isStarting(sessionId)) return Promise.resolve({ decision: "none" });
-    for (const old of this.polls.values()) if (old.sessionId === sessionId) this.spawn(this.finishPoll(old, { decision: "none" }, this.m().pollMovedToTerminal));
     const key = randomUUID().replaceAll("-", "").slice(0, PERMISSION_KEY_CHARS);
     return new Promise(resolve => {
-      const p: Poll = { key, sessionId, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], done: false, resolve };
+      const p: Poll = { key, sessionId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], done: false, resolve };
       this.polls.set(key, p);
       if (signal.aborted) {
-        this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollMovedToTerminal));
+        this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollHookEnded));
         return;
       }
-      signal.addEventListener("abort", () => this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollMovedToTerminal)), { once: true });
+      signal.addEventListener("abort", () => this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollHookEnded)), { once: true });
       this.log.info(`question poll ${key} for session ${sessionId}: ${questions.length} question(s)`);
-      this.spawn(this.catchUp(sessionId, key).then(() => {
-        if (!p.done) this.queueQuestion(p);
-      }));
+      this.startNext(sessionId);
     });
+  }
+
+  // The polls of a session in the order they came; the first is the shown one.
+  private pollsOf(sessionId: string): Poll[] {
+    return [...this.polls.values()].filter(p => p.sessionId === sessionId);
+  }
+
+  // Starts the first poll of the session when it has not started yet: the window is asked for the text
+  // the agent wrote before the call, then the question is queued.
+  private startNext(sessionId: string): void {
+    const p = this.pollsOf(sessionId)[0];
+    if (!p || p.started) return;
+    p.started = true;
+    this.spawn(this.catchUp(sessionId, p.key).then(() => {
+      if (!p.done) this.queueQuestion(p);
+    }));
+  }
+
+  // Ends every poll of the session with one decision, the waiting ones too, without starting any of them.
+  // `settled` is when their messages show the outcome.
+  private endPolls(sessionId: string, decision: QuestionDecision, outcome: string): { polls: Poll[]; settled: Promise<void> } {
+    const polls = this.pollsOf(sessionId);
+    const settled = Promise.all(polls.map(p => this.finishPoll(p, decision, outcome, false))).then(() => {});
+    this.spawn(settled);
+    return { polls, settled };
   }
 
   // The agent's text before the tool call reaches the hub only when the
@@ -1120,10 +1163,13 @@ ${msg.text}`);
     if (this.outbox.add(`poll:${p.key}:${p.index}`, p.sessionId, [piece])) this.spawn(this.pump(p.sessionId));
   }
 
-  private async finishPoll(p: Poll, decision: QuestionDecision, outcome: string): Promise<void> {
+  // Ends one poll. By default the next poll of the session, if any, starts; a bulk end of the session's
+  // polls passes advance=false, since none is left to start.
+  private async finishPoll(p: Poll, decision: QuestionDecision, outcome: string, advance = true): Promise<void> {
     if (p.done) return;
     p.done = true;
     this.polls.delete(p.key);
+    if (advance) this.startNext(p.sessionId);
     p.outcomes[p.index] = outcome;
     p.resolve(decision);
     // The agent has the answers now; with none, it never gets them.
@@ -1166,10 +1212,11 @@ ${msg.text}`);
     const ack = (text?: string) => api.answerCallbackQuery(press.id, text).catch(warn("answering a button press"));
     const parsed = parsePollPress(press.data);
     const known = parsed ? this.polls.get(parsed.key) : undefined;
-    // Nobody is left to take the answer: the question moves to the terminal and the button is stale.
+    // Nobody is left to take the answer: the session's polls are refused with a request to ask again and the button is stale.
     const closed = known && !this.connOf(known.sessionId);
-    if (known && closed) this.spawn(this.finishPoll(known, { decision: "none" }, this.m().pollMovedToTerminal));
-    const p = closed ? undefined : known;
+    if (known && closed) this.endPolls(known.sessionId, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+    // Only the shown poll of a session takes presses; a waiting one has no message.
+    const p = closed || !known?.started ? undefined : known;
     const q = p?.questions[p.index];
     const action = parsed?.action;
     const valid = p && q && parsed?.index === p.index && action !== undefined && (typeof action === "number" ? action >= 1 && action <= q.options.length : action !== "done" || q.multiSelect);
@@ -1180,7 +1227,8 @@ ${msg.text}`);
     }
     if (action === "cancel") {
       this.log.info(`question poll ${p.key} cancelled by ${press.fromId}`);
-      const done = this.finishPoll(p, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled);
+      // Cancelling the question ends the session's waiting polls too: they are the same unanswered turn.
+      const done = this.endPolls(p.sessionId, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled).settled;
       await ack();
       await done;
       return;
@@ -1606,10 +1654,11 @@ ${msg.text}`);
       return;
     }
     this.log.error(`Telegram rejected a message for session ${item.sessionId}: ${reason}\n--- text ---\n${item.text}\n--- end ---`);
-    // A question the topic cannot show is asked in the terminal.
+    // A question the topic cannot show is refused, not left to a terminal dialog the owner cannot see; the
+    // next poll of the session, if any, is shown.
     const pollKey = item.notice ? undefined : POLL_ITEM.exec(item.id)?.[1];
     const poll = pollKey ? this.polls.get(pollKey) : undefined;
-    if (poll) this.spawn(this.finishPoll(poll, { decision: "none" }, this.m().pollMovedToTerminal));
+    if (poll) this.spawn(this.finishPoll(poll, { decision: "deny", reason: askAgainReason("notShown") }, this.m().pollAskedAgain));
     if (item.notice) {
       this.outbox.remove(item.id);
       this.settled(item);
@@ -1840,13 +1889,13 @@ ${msg.text}`);
   // ordinary message, since the agent waits for the answer and has no turn to
   // stop. Returns the message to deliver, or undefined when nothing is left of it.
   private async toPoll(api: TelegramApi, sessionId: string, m: Message): Promise<Message | undefined> {
-    let p: Poll | undefined;
-    for (const open of this.polls.values()) if (open.sessionId === sessionId) p = open;
+    // The first poll of the session is the one shown; the others wait unseen and take no message.
+    const p = this.pollsOf(sessionId)[0];
     if (!p) return m;
     const role = pollRole(m, this.botUsername);
     if (role === "pass") return m;
     if (role === "cancel") {
-      this.spawn(this.finishPoll(p, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled));
+      this.endPolls(sessionId, { decision: "deny", reason: CANCEL_REASON }, this.m().pollCancelled);
       // Answer messages still waiting reach the agent before this one.
       await this.takeAnswer(p.key);
       const plain = withoutInterrupt(m);
@@ -2341,10 +2390,7 @@ ${msg.text}`);
   // to the terminal and are not swallowed), batches queued or waiting and an open replay give their
   // messages up, so none reaches a window that is about to end.
   private capturePending(sessionId: string): void {
-    for (const p of this.polls.values()) if (p.sessionId === sessionId) {
-      this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollMovedToTerminal));
-      this.spawn(this.takeAnswer(p.key));
-    }
+    for (const p of this.endPolls(sessionId, { decision: "none" }, this.m().pollMovedToTerminal).polls) this.spawn(this.takeAnswer(p.key));
     for (const entry of this.batchItems.get(sessionId) ?? []) {
       entry.captured = true;
       for (const message of entry.messages) this.hold(sessionId, { message });

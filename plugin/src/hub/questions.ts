@@ -20,12 +20,31 @@ export const POLL_PREFIX = "q:";
 // Goes to the agent, so always English.
 export const CANCEL_REASON = "The user cancelled the question in Telegram. Do not ask it again; end your turn and wait for their message.";
 
+// Why a poll that the owner could not answer was refused with a deny. The deny keeps the agent from falling
+// into a terminal dialog the owner cannot see; the reason tells it what happened and what to do. Goes to
+// the agent, so always English.
+export type AskAgainWhy = "hubStopping" | "windowGone" | "notShown";
+
+const ASK_AGAIN_WHY: Record<AskAgainWhy, string> = {
+  hubStopping: "the Telegram hub was restarting",
+  windowGone: "the connection of this session to the Telegram hub was lost",
+  notShown: "Telegram did not accept the message with the question (it may be too long or malformed)",
+};
+
+export function askAgainReason(why: AskAgainWhy): string {
+  return `The question got no answer in Telegram because ${ASK_AGAIN_WHY[why]}. Nothing was answered and nothing was asked in the terminal. Ask it again with a single AskUserQuestion call, shorter or simpler if it was long.`;
+}
+
 // An open poll. Questions go one at a time: index is the one shown now.
 // Each shown question has its message id once sent and its outcome line
 // once answered; an outcome set before the send goes with the send.
+// Polls of one session are served one after another in the order they came:
+// only the first of them is started (catching up, shown, answered); the rest
+// wait unseen until it ends.
 export type Poll = {
   key: string;
   sessionId: string;
+  started: boolean;
   questions: AskQuestion[];
   answers: Record<string, string>;
   index: number;

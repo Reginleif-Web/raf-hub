@@ -6,6 +6,7 @@ import { existsSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Hub } from "../src/hub/hub.ts";
 import { saveRuns } from "../src/hub/exec-runs.ts";
+import { askAgainReason } from "../src/hub/questions.ts";
 import { EXEC_CARD_MS, EXEC_CHECK_MS, EXEC_MAX_AGE_MS } from "../src/hub/exec.ts";
 import { FakeExec } from "./fake-exec.ts";
 import { buttonPress, topicMsg } from "./fake-telegram.ts";
@@ -323,7 +324,7 @@ function fakeWindow(sessionId: string, busy = false): Parameters<Hub["onClose"]>
 }
 
 function pollFor(sessionId: string) {
-  return { key: "q", sessionId, questions: [], answers: {}, index: 0, checked: new Set<number>(), messageIds: [], outcomes: [], taken: [], done: false, resolve() {} };
+  return { key: "q", sessionId, started: true, questions: [], answers: {}, index: 0, checked: new Set<number>(), messageIds: [], outcomes: [], taken: [], done: false, resolve() {} };
 }
 
 test("each specified work category blocks update exit, while a pending shell does not", () => {
@@ -384,15 +385,17 @@ test("work nobody can finish does not hold back the update exit", () => {
   expect(hub["rigIdle"]()).toBe(false);
 });
 
-test("a question button of a closed window is stale: the question goes to the terminal", async () => {
+test("a question button of a closed window is stale: the poll is refused with a request to ask again", async () => {
   const f = fixture();
   const hub = f.hub;
-  const poll = { ...pollFor("closed"), key: "ab12", questions: [{ question: "Pick", header: "Pick", multiSelect: false, options: [{ label: "A", description: "" }] }] };
+  const decisions: unknown[] = [];
+  const poll = { ...pollFor("closed"), key: "ab12", questions: [{ question: "Pick", header: "Pick", multiSelect: false, options: [{ label: "A", description: "" }] }], resolve: (d: unknown) => { decisions.push(d); } };
   hub["polls"].set("ab12", poll);
   const answers: (string | undefined)[] = [];
   f.api.answerCallbackQuery = async (_id, text) => { answers.push(text); return true; };
   await hub["onPollPress"](f.api, GROUP, { id: "1", data: "q:ab12:0:1", messageId: 5, fromId: USER });
   expect(hub["polls"].size).toBe(0);
+  expect(decisions).toEqual([{ decision: "deny", reason: askAgainReason("windowGone") }]);
   expect(answers).toEqual([en.pollStale]);
   expect(f.removed).toEqual([5]);
   expect(hub["rigIdle"]()).toBe(true);

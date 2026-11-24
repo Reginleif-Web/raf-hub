@@ -31,15 +31,25 @@ that is, shows the dialog in the terminal. All the "fallback" cases below rely o
 
 ## Behavior
 
+**Principle.** While Telegram mode is on, a question never ends silently in a terminal dialog the owner cannot see,
+and an answer belongs to exactly one `AskUserQuestion` call. So a poll ends with "no decision" (the dialog opens in the
+terminal) only when the owner chose the terminal or the dialog is going away anyway; every other end, on the hub side
+and on the hook side, is a refusal (`deny`) with a reason that tells the agent what to do. The table under "End of the
+wait without an answer" lists every path.
+
 **Where the poll is.** Telegram mode is on: the poll is only in the topic; in the terminal, while waiting, the hook's
 status line "Waiting for an answer in Telegram" (`statusMessage`). Mode is off: the hook decides nothing, the dialog is in the
-terminal, as before. If the mode is switched off while a poll is open (`tg_disable`), the poll is closed as if it timed out: the dialog opens in the terminal, and the message in the topic
-is marked "⌛ The poll was moved to the terminal".
+terminal, as before. If the mode is switched off while a poll is open (`tg_disable`), the owner chose the terminal: the
+polls of the session end with no decision, the dialog opens in the terminal, and the message in the topic
+is marked "⌛ The poll was moved to the terminal (/terminal shows it here)".
 
-**Time limit.** The poll waits for an answer for 24 hours (hook `timeout` 86400 s). When it expires, the poll opens in the
-terminal, the message in the topic is marked "⌛ The poll was moved to the terminal", and the buttons are removed. If the window or the
-hub restarted while the poll was open, it also ends up in the terminal (the hook ended without an answer);
-pressing a button of such a poll answers "The poll is outdated" and removes the buttons, as with permissions.
+**Time limit.** The poll waits for an answer for 24 hours (hook `timeout` 86400 s). When it expires, the hook ends by
+itself with a refusal (the agent is told to ask again if the answer is still needed), and the message in the topic is
+marked "⌛ The poll ended on the terminal side (Esc, the time limit or a restart). If the agent still waits for an
+answer, it may be a dialog in the terminal: /terminal shows it here, or answer it there", and the buttons are removed.
+The hub cannot tell the time limit from Esc or a restart (it only sees the request abort), so the one line names all
+three and says what to do. A graceful stop of the hub (`Hub.stop`) denies the polls, see the table. Pressing a button
+of an ended poll answers "The poll is outdated" and removes the buttons, as with permissions.
 
 **Several questions.** One call can have up to 4 questions. They arrive one by one: the next one comes
 after the previous one is answered. The agent gets all the answers at once, when all are answered.
@@ -74,9 +84,10 @@ close the poll; `/stop` ends the session, and its poll becomes outdated.
 
 **Cancel.** "✖️ Cancel" closes the poll: the hook answers `permissionDecision: "deny"` with the reason
 "The user cancelled the question in Telegram. Do not ask it again; end your turn and wait for their
-message." The agent ends the turn.
+message." The agent ends the turn. Polls of the same session that wait behind it are closed the same way: the owner
+cancelled the questions of that step, not one call.
 
-**A message with "!" while a poll is open.** It closes the poll the same way as cancel, and the message itself
+**A message with "!" while a poll is open.** It closes the polls of the session the same way as cancel, and the message itself
 goes to the agent as an ordinary incoming message: without "!" and without an interrupt (the agent is waiting for the answer, there is nothing to interrupt, and
 an interrupt would break the turn that starts with the denial). A lone "!" only closes the poll and sends the agent
 nothing.
@@ -85,8 +96,14 @@ nothing.
 multiple choice, the labels separated by commas; for a custom answer, its text, cut like a quote in the
 reply context), "✖️ Poll cancelled" or "⌛ The poll was moved to the terminal".
 
-**One poll per session.** The agent cannot call a second `AskUserQuestion` while it waits for the first. If a
-new poll still arrives (the old hook died), the old one is closed as outdated.
+**Polls of one session are served one after another.** An agent may call `AskUserQuestion` several times in one
+step (parallel tool calls), and each call has its own hook and its own request. The hub keeps the polls of a session
+in arrival order: only the first is shown; the others wait unseen (no message, no catch-up) until the one before them
+ends, then the next is shown the same way. A newer poll never ends an older one, and every answer goes to the hook of
+the poll it was given for. The MCP server instructions also ask the agent to make one `AskUserQuestion` call per step
+and put every question of the step into that call (it takes up to 4); this only lowers the chance of a queue, the
+queue is the guarantee. When the hook of a waiting poll ends, only that poll leaves the queue. A press on a button of a
+poll that is not shown yet counts as outdated.
 
 ## How it works
 
@@ -96,12 +113,37 @@ new poll still arrives (the old hook died), the old one is closed as outdated.
 `timeout: false`, otherwise Bun drops an idle request after 5 minutes). The wait ends by itself in two
 cases, even if Claude Code never killed the hook: at the hook's own limit, one minute less than `timeout`
 (`src/hook/question-limits.ts`), and when the parent process is gone (checked every 2 s with the signal
-`kill(pid, 0)`, without starting processes). Then the hook aborts the request and exits silently. The hub answers
+`kill(pid, 0)`, without starting processes). Then the hook aborts the request. The hub answers
 `{decision: "allow", answers}`, `{decision: "deny", reason}` or `{decision: "none"}`. The hook prints the
-decision only for allow and deny (it waits for the stdout write to finish before exiting, so a long answer is not
-cut); on none, an error or an unreachable hub it stays silent, and the dialog opens in the
-terminal. An `mcp_tool` hook was not chosen: the wait would run into MCP request timeouts, while a `command` hook
-has a single limit, its `timeout`.
+decision for allow and deny (it waits for the stdout write to finish before exiting, so a long answer is not
+cut); on none it stays silent and the dialog opens in the terminal. An `mcp_tool` hook was not chosen: the wait
+would run into MCP request timeouts, while a `command` hook has a single limit, its `timeout`.
+
+**Acceptance signal.** Once the hub has accepted a poll (mode on, session known, not starting) it answers at once
+with the response header `x-question-accepted: 1` (`QUESTION_ACCEPTED_HEADER`, `src/shared/protocol.ts`) and a first
+body chunk of one space, which makes Bun send the headers right away; the body is a streamed response, and when the
+poll ends the decision JSON follows the space and the stream closes. A JSON parser skips the leading space, so a hook
+that does not know the header reads the body unchanged. A hub that refuses or has no session answers a plain JSON
+`none` without the header. Aborting the request after the headers still reaches the hub (`req.signal`) and ends the
+poll with none and "ended on the terminal side".
+
+**After acceptance the hook never ends silently by accident.** If the hook saw the header, then every technical end
+that follows is a refusal with an English reason: the connection dropped, the hub was killed, the body is not a
+valid decision, or the hook's own time limit ran out. The reason says: the hub took the question, nothing
+was answered, nothing was asked in the terminal, and if the answer is still needed, ask again with a single
+`AskUserQuestion` call (`src/hook/question-reasons.ts`). An explicit `none` from the hub stays silent (the dialog
+opens in the terminal). When the parent process is gone nothing reads the output, so the hook exits silently.
+
+**Mixed versions.** A new hook with a hub that sends no header (an older hub) never saw an acceptance, so it behaves
+as before: every technical end is silent. An old hook with a new hub parses the body as JSON as before.
+
+**Hub unreachable.** If the request fails before any response (connection refused, or the connection closed before
+the headers) or the answer has an error status, the hook reads the persisted Telegram mode of the session read-only (`readSessionMode`, the
+`sessions.json` of the state directory; it never writes, never renames a corrupt file). Mode on: refusal with the
+reason that the hub is unreachable and the agent should write the question as plain text in its reply and end its
+turn, with no retry loop (a repeated `AskUserQuestion` would hit the same dead hub). Mode off, session unknown, or
+the file unreadable: silent, the dialog opens in the terminal. A deadline or a gone parent before any response is
+silent.
 
 **Session.** The hub finds the session by the window with this `messagingSocket`, otherwise by `session_id`. Mode off
 or no session: none. The hub removes its idle timeout from the request and keeps it open until the poll
@@ -126,16 +168,46 @@ poll. A poll closed during the wait is not shown.
 separated by ", "; a custom answer is the message text (or caption) and file marks separated by a space; several messages
 of one answer are separated by a blank line, in the order sent.
 
-**End of the wait without an answer.** The hook is killed (`timeout` expired, the window closed, probably Esc, not
-verified): the request to the hub is aborted, and the poll is closed with "⌛ The poll was moved to the terminal". The following
-are closed the same way: the old poll of a session when a new one comes, polls when the hub stops, polls of a session that has no
-connected windows left, polls of a session whose Telegram mode was switched off, and a poll whose message
-Telegram did not accept. Pressing a button of a
-closed poll answers "The poll is outdated" and removes the buttons.
+**End of the wait without an answer.** Every way a poll ends without an answer, and what the hook gets. Rule: with
+the mode on, the hub itself never returns "none" when the owner did not choose the terminal and the dialog would
+outlive the hub's knowledge of it.
+
+| Path | Decision | Topic message |
+|---|---|---|
+| Mode off at the request, or turned off while open | none (owner chose the terminal) | moved to the terminal |
+| Esc, window closed (request aborted) | none, for that poll only (the hook is gone and prints nothing) | ended on the terminal side, /terminal or answer there if the agent still waits |
+| The hook's own time limit after acceptance | deny, ask again (printed by the hook); the request is aborted, so the hub sees the same end as above | same |
+| Session being started (`isStarting`) at the request | none, no acceptance header (the session ends and the dialog goes with it) | nothing |
+| Session stopped or cleaned up while open (`capturePending`) | none (the session ends and the dialog goes with it) | moved to the terminal |
+| Cancel button or "!" | deny, cancelled (all polls of the session) | poll cancelled |
+| Hub stops gracefully | deny, ask again (`hubStopping`), all polls | closed, agent asked to ask again |
+| The window of the session is gone, or a button is pressed with no connected window | deny, ask again (`windowGone`) | same |
+| Telegram did not accept the poll message | deny, ask again (`notShown`); the next poll is shown | same |
+| Hub crash or restart without a graceful stop after acceptance | deny, ask again (printed by the hook: connection lost) | nothing (the hub is gone) |
+| The body of the answer is unreadable after acceptance | deny, ask again (printed by the hook) | nothing |
+| Hub unreachable at the request or answers with an error status, mode on in `sessions.json` | deny, write the question as plain text and end the turn (printed by the hook) | nothing (the hub is gone) |
+| Hub unreachable, closed the connection before acceptance or answered with an error status, mode off or unknown | none by silence: the hook prints nothing | nothing |
+| The parent process of the hook is gone | none by silence: nothing reads the output | ended on the terminal side |
+
+A denied poll from the hub tells the agent why the question got no answer in Telegram, that nothing was answered and
+nothing was asked in the terminal, and to ask again with a single `AskUserQuestion` call. A refusal printed by the
+hook says the hub took the question, with the same facts. Pressing a button of a closed
+poll answers "The poll is outdated" and removes the buttons.
+
+Known facts about the terminal side, not more: the hub sees an Esc or a killed hook only as an aborted request, so it cannot
+tell the time limit, Esc and a restart apart; `sendInterrupt` writes a prompt to the window's messaging socket and is
+documented as ending the turn as Esc does, but whether it closes an open `AskUserQuestion` dialog, and whether Esc
+kills the hook, has not been verified, because a live probe needs the container with tmux
+(`scripts/claude-probe-terminal.ts`).
+
+**Open.** The hub has no signal that proves "a question went to the terminal and the session has not moved while owner
+messages wait": no hook-side or window-side report says that a dialog is open. So nothing closes a stale terminal
+dialog by itself. A hub that dies after acceptance is not reconnected: the hook denies and the agent asks again, which
+reaches the restarted hub if it is back by then.
 
 **Buttons.** Labels are cut to 64 characters; `callback_data` is
 `q:<key>:<question number>:<action>`, the key is 8 hex characters, as with permissions. Pressing a button of a
 question that is not the current one counts as outdated.
 
-**State.** The hub keeps open polls in memory; when the hub restarts, the request is aborted and the poll
-opens in the terminal.
+**State.** The hub keeps open polls in memory. A graceful stop denies them (ask again); a crash drops the connection,
+and the hook, which saw the acceptance, denies with the same advice, see the table.
