@@ -33,7 +33,7 @@ import { catalogOf, DEFAULT_LANGUAGE } from "../shared/i18n/index.ts";
 import { literal, toTelegram } from "../shared/markdown.ts";
 import { albums, kindOf } from "../shared/media.ts";
 import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER } from "../shared/protocol.ts";
-import { hookBody, pluginToHub, questionBody, sendFilesMessage, sendMessage, turnEndBody, turnFailedBody } from "../shared/protocol-schema.ts";
+import { hookBody, pluginToHub, questionAsker, questionBody, sendFilesMessage, sendMessage, turnEndBody, turnFailedBody } from "../shared/protocol-schema.ts";
 import { loadCards, saveCards } from "./cards.ts";
 import { loadPollOffset, savePollOffset } from "./poll-offset.ts";
 import { DEFAULT_CONFIG_DIR, defaultLoginAccount, isDefaultConfigDir } from "./default-account.ts";
@@ -311,6 +311,13 @@ export class Hub {
   // Open AskUserQuestion polls, by the key in their buttons' data; in the order they came, so the first of a
   // session is the shown one and the rest wait unseen.
   private polls = new Map<string, Poll>();
+  // The tool calls the hub took as polls, by session: such a call is never a dialog hidden in the terminal,
+  // even in the moments between its poll ending and its result reaching the transcript. A session whose call
+  // came without an id (an older hook) is in `anonymousAsk`: none of its calls can be told apart.
+  private taken = new Map<string, Set<string>>();
+  private anonymousAsk = new Set<string>();
+  // The dialogs already warned about, by session, so each call is warned about once.
+  private warnedDialogs = new Map<string, Set<string>>();
   // Questions waiting for their window to catch up, by poll key.
   private catchUps = new Map<string, () => void>();
   // Messages that answer a poll's question, by poll key: those sent together
@@ -624,18 +631,21 @@ export class Hub {
       return new Response("ok");
     }
     if (url.pathname === "/question" && req.method === "POST") {
-      const r = questionBody.safeParse(await req.json().catch(() => undefined));
-      if (!r.success) return new Response("bad question body", { status: 400 });
-      const { messagingSocket, session_id: hookSession, tool_input } = r.data;
-      // The window's current session may differ from the hook's after a
-      // session switch; the window knows the one with the topic.
-      let target: WS | undefined;
-      for (const ws of this.conns) if (messagingSocket !== undefined && ws.data.windowKey === messagingSocket) target = ws;
-      const sessionId = (target ?? this.connOf(hookSession))?.data.sessionId ?? hookSession;
+      const raw: unknown = await req.json().catch(() => undefined);
+      const r = questionBody.safeParse(raw);
+      if (!r.success) {
+        // With the mode on the hook denies a call it got an error for, so the call is not a hidden dialog.
+        const who = questionAsker.safeParse(raw);
+        const sid = who.success ? this.questionSession(who.data.messagingSocket, who.data.session_id) : undefined;
+        if (who.success && sid !== undefined && this.store.get(sid)?.enabled) this.takeCall(sid, who.data.tool_use_id);
+        return new Response("bad question body", { status: 400 });
+      }
+      const { messagingSocket, session_id: hookSession, tool_input, tool_use_id } = r.data;
+      const sessionId = this.questionSession(messagingSocket, hookSession);
       if (!this.store.get(sessionId)?.enabled || this.isStarting(sessionId)) return Response.json({ decision: "none" });
       // The answer may take hours; the hook's own timeout bounds the wait.
       server.timeout(req, 0);
-      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal);
+      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal, tool_use_id);
       // The poll is accepted: the headers and a first blank chunk go out at once (a response streamed from
       // a ReadableStream sends its headers with the first chunk), so the hook knows the poll is open. The
       // decision follows as JSON; JSON.parse skips the leading blank, so a hook that does not look at the
@@ -644,12 +654,13 @@ export class Hub {
       const body = new ReadableStream<Uint8Array>({
         start: controller => {
           controller.enqueue(encoder.encode(" "));
-          void decision.then(d => {
-            try {
-              controller.enqueue(encoder.encode(JSON.stringify(d)));
-              controller.close();
-            } catch {} // the hook went away and the stream is closed already
-          });
+        },
+        pull: async controller => {
+          const answer = JSON.stringify(await decision);
+          try {
+            controller.enqueue(encoder.encode(answer));
+            controller.close();
+          } catch {} // the hook went away and the stream is closed already
         },
       });
       return new Response(body, { headers: { "content-type": "application/json", [QUESTION_ACCEPTED_HEADER]: "1" } });
@@ -720,7 +731,12 @@ export class Hub {
     if (!this.running) return;
     if (sid) this.log.info(`window for session ${sid} disconnected`);
     // Without its window the session cannot take an answer any more.
-    if (sid && !this.connOf(sid)) this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+    if (sid && !this.connOf(sid)) {
+      this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+      this.taken.delete(sid);
+      this.anonymousAsk.delete(sid);
+      this.warnedDialogs.delete(sid);
+    }
     // The window a stop or a cleanup ended is gone: what was held meanwhile goes the way a new topic message would.
     const closing = [...this.launches].filter(([launchSid, l]) => l.ending?.closing && this.endingSettled(launchSid, l.old));
     for (const [launchSid, l] of closing) this.finishEnding(launchSid, l);
@@ -883,6 +899,9 @@ ${msg.text}`);
       case "caughtUp":
         this.catchUps.get(msg.id)?.();
         return;
+      case "dialog":
+        this.spawn(this.onDialog(ws, msg.toolUseId, msg.questions));
+        return;
     }
   }
 
@@ -1033,8 +1052,12 @@ ${msg.text}`);
   private setEnabled(sessionId: string, on: boolean, byUser = false): boolean {
     this.store.setEnabled(sessionId, on, byUser);
     this.pushState(sessionId);
-    // With the mode off the user answers in the terminal, as on a timeout.
-    if (!on) this.endPolls(sessionId, { decision: "none" }, this.m().pollMovedToTerminal);
+    // With the mode off the user answers in the terminal. The calls become dialogs there, so they are no
+    // longer calls the hub has taken.
+    if (!on) {
+      const ids = this.taken.get(sessionId);
+      for (const p of this.endPolls(sessionId, { decision: "none" }, this.m().pollMovedToTerminal).polls) if (p.toolUseId !== undefined) ids?.delete(p.toolUseId);
+    }
     return on;
   }
 
@@ -1098,10 +1121,11 @@ ${msg.text}`);
   // AskUserQuestion again while an earlier call still waits, so polls of one
   // session are served one after another: a later one waits unseen until the
   // earlier one ends, and an older poll is never ended by a newer one.
-  private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal): Promise<QuestionDecision> {
+  private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal, toolUseId?: string): Promise<QuestionDecision> {
     const key = randomUUID().replaceAll("-", "").slice(0, PERMISSION_KEY_CHARS);
+    this.takeCall(sessionId, toolUseId);
     return new Promise(resolve => {
-      const p: Poll = { key, sessionId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], done: false, resolve };
+      const p: Poll = { key, sessionId, toolUseId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], done: false, resolve };
       this.polls.set(key, p);
       if (signal.aborted) {
         this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollHookEnded));
@@ -1111,6 +1135,45 @@ ${msg.text}`);
       this.log.info(`question poll ${key} for session ${sessionId}: ${questions.length} question(s)`);
       this.startNext(sessionId);
     });
+  }
+
+  // The session a question belongs to. The window's current session may differ from the hook's after a
+  // session switch; the window knows the one with the topic.
+  private questionSession(messagingSocket: string | undefined, hookSession: string): string {
+    let target: WS | undefined;
+    for (const ws of this.conns) if (messagingSocket !== undefined && ws.data.windowKey === messagingSocket) target = ws;
+    return (target ?? this.connOf(hookSession))?.data.sessionId ?? hookSession;
+  }
+
+  // Notes that the hub handled a tool call of the session; a call without an id cannot be told apart later.
+  private takeCall(sessionId: string, toolUseId: string | undefined): void {
+    if (toolUseId === undefined) {
+      this.anonymousAsk.add(sessionId);
+      return;
+    }
+    const ids = this.taken.get(sessionId) ?? new Set<string>();
+    ids.add(toolUseId);
+    this.taken.set(sessionId, ids);
+  }
+
+  // A window reported an AskUserQuestion call that has no result in the transcript. When the hub did not
+  // take the call, nothing has asked the owner: the session waits on a dialog in its terminal, and the
+  // topic's messages wait behind it. The owner is told once per call.
+  //
+  // Every call the hub took is in `taken` before its hook returns, so before its tool_use is written to the
+  // transcript: a call missing from `taken` is no hub poll, however short ago it was written. A supervised
+  // session shows its terminal itself, and only a terminal (cli) session has a dialog to wait on.
+  private async onDialog(ws: WS, toolUseId: string, questions: string[]): Promise<void> {
+    const sid = ws.data.sessionId;
+    if (!sid || ws.data.entrypoint !== CLI_ENTRYPOINT || !this.store.get(sid)?.enabled) return;
+    if (this.taken.get(sid)?.has(toolUseId) || this.anonymousAsk.has(sid) || this.pollsOf(sid).length > 0) return;
+    const warned = this.warnedDialogs.get(sid) ?? new Set<string>();
+    if (warned.has(toolUseId)) return;
+    // Before the awaited check below, so a second report of the call meanwhile finds it warned.
+    warned.add(toolUseId);
+    this.warnedDialogs.set(sid, warned);
+    if (this.terminals && (await this.terminals.running(sid))) return;
+    this.notice(sid, this.m().dialogWaiting({ questions }), "warning");
   }
 
   // The polls of a session in the order they came; the first is the shown one.

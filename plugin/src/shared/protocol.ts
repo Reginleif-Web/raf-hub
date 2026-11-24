@@ -55,7 +55,10 @@ export type PluginToHub =
   // The agent started working, or stopped: its turn ended or it waits for the user.
   | { type: "busy"; busy: boolean }
   // The answer to catchUp: the text written before the tool call is sent.
-  | { type: "caughtUp"; id: string };
+  | { type: "caughtUp"; id: string }
+  // An AskUserQuestion call of the transcript that has no result yet, sent when a
+  // topic message arrives; questions are the question texts.
+  | { type: "dialog"; toolUseId: string; questions: string[] };
 
 export type HubToPlugin =
   | { type: "state"; enabled: boolean; topicTitle?: string }
@@ -110,6 +113,8 @@ export type AskQuestion = {
 export type QuestionBody = {
   messagingSocket?: string;
   session_id: string;
+  // The id of the tool call (older hooks omit it).
+  tool_use_id?: string;
   tool_input: { questions: AskQuestion[] };
 };
 

@@ -200,10 +200,31 @@ documented as ending the turn as Esc does, but whether it closes an open `AskUse
 kills the hook, has not been verified, because a live probe needs the container with tmux
 (`scripts/claude-probe-terminal.ts`).
 
-**Open.** The hub has no signal that proves "a question went to the terminal and the session has not moved while owner
-messages wait": no hook-side or window-side report says that a dialog is open. So nothing closes a stale terminal
-dialog by itself. A hub that dies after acceptance is not reconnected: the hook denies and the agent asks again, which
-reaches the restarted hub if it is back by then.
+**A dialog the owner does not see.** A dialog can sit in the terminal with no poll in Telegram: it opened while
+Telegram mode was off, or the hook gave up. Claude Code queues every topic message behind it, so the owner would get
+silence. When a message of the owner is delivered to the window of an interactive (`cli`) session with the mode on,
+the topic gets one warning notice if all of this holds:
+
+- the main transcript holds an `AskUserQuestion` call with no `tool_result`, and nothing since has overtaken it: no
+  interrupt, no input typed in the terminal, no message of the hub taken, no end of a turn, no record of another agent
+  message (the agent cannot go on while a dialog is open). Records of subagents are never read, and the window follows
+  the transcript from its end, so a call made before `--resume` and a huge prefix are never seen or read;
+- the hub took no poll for the call. The hook sends its `tool_use_id`; the hub notes every call it took (polls that
+  ended in a refusal included) before the hook returns, which is before Claude Code writes the call to the transcript.
+  A poll the owner sent to the terminal by turning the mode off is no longer a call the hub took. A call missing from that set is therefore no hub poll, however short ago it was written, so no
+  timer decides it. A session whose hook sent no id (an older hook) is never warned, as its calls cannot be told apart;
+- the session holds no open or queued poll, and no terminal supervisor runs for it (the supervised terminal shows
+  such a dialog itself).
+
+The notice quotes the question texts, says that the session waits on a dialog in its terminal and that messages wait
+behind it, and that it must be answered on the PC (a session started with `/run` has `/terminal`). One notice per
+call, kept until the session's last window closes. The window reads only what the tailer already has, at the moment
+of the message; nothing polls.
+
+Gaps, none of them a false notice: a dialog not yet flushed to the transcript at that moment is missed until the next
+message; the owner may answer on the PC between the check and the notice; a notice is not repeated for a call, even if
+the first was missed; sessions of the SDK entrypoints are not covered. A hub that dies after acceptance is not
+reconnected: the hook denies and the agent asks again, which reaches the restarted hub if it is back by then.
 
 **Buttons.** Labels are cut to 64 characters; `callback_data` is
 `q:<key>:<question number>:<action>`, the key is 8 hex characters, as with permissions. Pressing a button of a

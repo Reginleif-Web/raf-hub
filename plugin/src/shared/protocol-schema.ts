@@ -35,6 +35,7 @@ export const pluginToHub: z.ZodType<PluginToHub> = z.union([
   z.object({ type: z.literal("seen"), messageIds: z.array(z.number()) }),
   z.object({ type: z.literal("busy"), busy: z.boolean() }),
   z.object({ type: z.literal("caughtUp"), id: z.string() }),
+  z.object({ type: z.literal("dialog"), toolUseId: z.string(), questions: z.array(z.string()) }),
 ]);
 
 export const hubToPlugin: z.ZodType<HubToPlugin> = z.union([
@@ -83,8 +84,12 @@ const askQuestion: z.ZodType<AskQuestion> = z.object({
 export const questionBody: z.ZodType<QuestionBody> = z.object({
   messagingSocket: z.string().optional(),
   session_id: z.string(),
+  tool_use_id: z.string().optional(),
   tool_input: z.object({ questions: z.array(askQuestion).min(1) }),
 });
+
+// Who asked, read from a body that questionBody refused: enough to know which call it was.
+export const questionAsker = z.object({ messagingSocket: z.string().optional(), session_id: z.string(), tool_use_id: z.string().optional() });
 
 export const questionDecision: z.ZodType<QuestionDecision> = z.union([
   z.object({ decision: z.literal("allow"), answers: z.record(z.string(), z.string()) }),

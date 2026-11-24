@@ -44,6 +44,8 @@ export function askAgainReason(why: AskAgainWhy): string {
 export type Poll = {
   key: string;
   sessionId: string;
+  // The tool call it asks for (an older hook sends no id).
+  toolUseId?: string | undefined;
   started: boolean;
   questions: AskQuestion[];
   answers: Record<string, string>;

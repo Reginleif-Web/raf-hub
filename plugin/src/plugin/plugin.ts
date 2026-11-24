@@ -22,6 +22,7 @@ import { notifies } from "../shared/notification.ts";
 import { PROTOCOL_VERSION } from "../shared/protocol.ts";
 import { enableResult } from "../shared/protocol-schema.ts";
 import { sessionTranscriptPath, transcriptPathFor } from "../transcript/locate.ts";
+import { OpenDialogs } from "../transcript/dialogs.ts";
 import { ModelVersions, recordModel } from "../transcript/model-versions.ts";
 import { parseRecord } from "../transcript/parse.ts";
 import { Relay } from "../transcript/relay.ts";
@@ -156,6 +157,8 @@ export class PluginCore {
   private cwd: string;
   private transcriptPath: string;
   private tailer: TranscriptTailer | undefined;
+  // The AskUserQuestion calls of the followed transcript that wait for a result.
+  private dialogs = new OpenDialogs();
   private subagents: SubagentWatcher | undefined;
   // The newest model versions seen, so cards name a current model by its line.
   private versions: ModelVersions;
@@ -341,6 +344,7 @@ export class PluginCore {
 
   private follow(path: string): void {
     this.tailer?.stop();
+    this.dialogs.clear();
     this.transcriptPath = path;
     this.titles = readSessionTitles(path);
     this.tailer = new TranscriptTailer({
@@ -374,6 +378,7 @@ export class PluginCore {
     // The session's own answers tell a new model version as well.
     const answered = recordModel(rec);
     if (answered) this.versions.see(answered.model);
+    this.dialogs.see(rec);
     for (const ev of parseRecord(rec).flatMap(e => this.settleApiError(e))) this.handle(ev);
   }
 
@@ -509,6 +514,10 @@ export class PluginCore {
         this.setEnabled(m.enabled);
         return;
       case "inbound":
+        // Before the message goes in, tell the hub which dialogs the transcript
+        // shows open, so it can warn the owner about one it did not ask itself.
+        this.tailer?.pollNow();
+        for (const d of this.dialogs.open()) this.client.send({ type: "dialog", toolUseId: d.id, questions: d.questions });
         this.deliver(m.content, m.meta, m.interrupt === true);
         return;
       case "switchSession":

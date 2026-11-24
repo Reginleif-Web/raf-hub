@@ -6,6 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, trunc
 import { join } from "path";
 import { Hub } from "../src/hub/hub.ts";
 import { SessionStore } from "../src/hub/sessions.ts";
+import { TerminalRelay } from "../src/hub/terminal-relay.ts";
 import { TelegramApi } from "../src/hub/telegram.ts";
 import { CHIME_MIN_TURN_MS, CONTINUE_PROMPT, cutLimitNote, filesRejectedPrompt, interruptPrompt, MAX_AUTO_CONTINUES, playConfiguredChime, PluginCore, STOP_ORDER } from "../src/plugin/plugin.ts";
 import { defaultTurnEndChime } from "../src/shared/chime.ts";
@@ -1069,6 +1070,216 @@ describe("tg_send_file", () => {
     await waitFor(() => channel.length === 1, 3000, "rejection prompt");
     expect(channel[0]).toEqual({ content: filesRejectedPrompt("a.txt: Request Entity Too Large"), meta: { user: "telegram-hub", reason: "files_rejected" } });
     expect(sent()).toEqual([]);
+  });
+});
+
+// A transcript record of an AskUserQuestion call with full question objects, and the result that closes it.
+const askTool = (id: string, texts: string[], messageId: string) => ({
+  type: "assistant",
+  isSidechain: false,
+  message: {
+    id: messageId,
+    role: "assistant",
+    content: [{ type: "tool_use", id, name: "AskUserQuestion", input: { questions: texts.map(question => ({ question, header: "Head", options: [{ label: "A", description: "" }, { label: "B", description: "" }], multiSelect: false })) } }],
+    stop_reason: "tool_use",
+  },
+});
+const toolResult = (id: string) => ({ type: "user", isSidechain: false, message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] } });
+
+// A dialog in the terminal that the owner cannot see: the call is in the transcript, the hub holds no poll for it.
+describe("a dialog waiting in the terminal", () => {
+  const Q = "Which database should the migration use?";
+  // A line the size of the transcript prefix of a long session; the reader must never take it whole.
+  const PREFIX_BYTES = 8 * 1024 * 1024;
+
+  // An interactive session with its topic (created at its first text), connected and on.
+  async function cliCore(entrypoint = "cli") {
+    const c = makeCore(SID, entrypoint);
+    await waitFor(() => hub.isConnected(SID), 3000, "plugin connected");
+    // An interactive session is on from the start; any other entrypoint is turned on by the agent.
+    if (entrypoint !== "cli") await c.enable();
+    await waitFor(() => c.enabled, 3000, "mode on");
+    append(assistantText("Ready", "end_turn", "a1"), closed);
+    await stopHook(true, "done");
+    await waitFor(() => sent().length === 1, 5000, "the first text, which opens the topic");
+    return c;
+  }
+
+  // One topic message of the owner, delivered to the window.
+  async function owner(text: string, extra?: Record<string, unknown>) {
+    const before = channel.length;
+    fake.pushUpdate(topicMsg({ chatId: GROUP, threadId: 100, fromId: ME, text, extra }));
+    await waitFor(() => channel.length === before + 1, 3000, `the message "${text}" at the window`);
+    await flushed();
+  }
+
+  // The warning, whatever its wording: it quotes the question and speaks of the terminal; the poll message does not.
+  const notices = () => sent().filter(m => m.text.includes(Q) && /terminal/i.test(m.text));
+
+  function postQuestion(id: string, texts: string[]) {
+    const questions = texts.map(question => ({ question, header: "Head", options: [{ label: "A", description: "" }, { label: "B", description: "" }], multiSelect: false }));
+    return fetch(`http://127.0.0.1:${port}/question`, {
+      method: "POST",
+      body: JSON.stringify({ messagingSocket: "pipe-1", session_id: SID, tool_use_id: id, tool_input: { questions } }),
+    }).then(r => r.json());
+  }
+
+  // The poll's message is in the topic, so its id is known to the hub.
+  const pollShown = (text: string) => waitFor(() => sent().some(m => m.text.includes(text) && !/terminal/i.test(m.text)), 3000, `the poll "${text}"`);
+
+  test("the owner's message gets one warning that quotes the question", async () => {
+    await cliCore();
+    append(askTool("u1", [Q], "m1"));
+    await owner("Hello?");
+    await waitFor(() => notices().length === 1, 3000, "the warning");
+    expect(notices()[0]).toEqual({ text: en.dialogWaiting({ questions: [Q] }), silent: false, topic: 100 });
+    expect(en.dialogWaiting({ questions: [Q] })).toContain(Q);
+  });
+
+  test("the warning comes once for a call, not once per message", async () => {
+    await cliCore();
+    append(askTool("u1", [Q], "m1"));
+    await owner("Hello?");
+    await waitFor(() => notices().length === 1, 3000, "the warning");
+    await owner("Anybody there?");
+    await owner("Please?");
+    expect(notices().length).toBe(1);
+  });
+
+  test("a call whose poll is open in the hub gets no warning", async () => {
+    await cliCore();
+    const poll = postQuestion("u1", [Q]);
+    await pollShown(Q);
+    append(askTool("u1", [Q], "m1"));
+    // An id below the poll's message passes the poll untouched, so it reaches the window.
+    await owner("an older message", { message_id: 1 });
+    expect(notices()).toEqual([]);
+    poll.catch(() => {});
+  });
+
+  test("while the hub holds a poll of the session, a call it did not take gets no warning either", async () => {
+    await cliCore();
+    const poll = postQuestion("u1", [Q]);
+    await pollShown(Q);
+    // u9 is no call of the hub; the session is busy with its poll, so the owner is not told of a second dialog.
+    append(askTool("u9", [Q], "m9"));
+    await owner("an older message", { message_id: 1 });
+    expect(notices()).toEqual([]);
+    poll.catch(() => {});
+  });
+
+  test("a call whose poll waits in the queue gets no warning", async () => {
+    await cliCore();
+    const first = postQuestion("u1", [Q]);
+    await pollShown(Q);
+    const second = postQuestion("u2", ["Which colour?"]);
+    append(askTool("u1", [Q], "m1"), askTool("u2", ["Which colour?"], "m2"));
+    await owner("an older message", { message_id: 1 });
+    expect(notices()).toEqual([]);
+    first.catch(() => {});
+    second.catch(() => {});
+  });
+
+  test("a call the hub answered, whose result is not yet written, gets no warning", async () => {
+    await cliCore();
+    const poll = postQuestion("u1", [Q]);
+    await pollShown(Q);
+    fake.pushUpdate(topicMsg({ chatId: GROUP, threadId: 100, fromId: ME, text: "SQLite" }));
+    expect(await poll).toEqual({ decision: "allow", answers: { [Q]: "SQLite" } });
+    // The poll is gone from the hub; Claude Code has written the call but not yet its result.
+    append(askTool("u1", [Q], "m1"));
+    await owner("and then?");
+    expect(notices()).toEqual([]);
+    append(toolResult("u1"));
+    await owner("done?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a call moved to the terminal with the mode off gets the warning once the mode is on again", async () => {
+    await cliCore();
+    const poll = postQuestion("u1", [Q]);
+    await pollShown(Q);
+    hub["setEnabled"](SID, false);
+    expect(await poll).toEqual({ decision: "none" });
+    append(askTool("u1", [Q], "m1"));
+    hub["setEnabled"](SID, true);
+    await owner("Hello?");
+    await waitFor(() => notices().length === 1, 3000, "the warning");
+  });
+
+  test("a malformed question of a session with the mode off leaves its terminal dialog to the warning", async () => {
+    const c = await cliCore();
+    hub["setEnabled"](SID, false);
+    await waitFor(() => !c.enabled, 3000, "mode off");
+    const res = await fetch(`http://127.0.0.1:${port}/question`, {
+      method: "POST",
+      body: JSON.stringify({ messagingSocket: "pipe-1", session_id: SID, tool_use_id: "u1", tool_input: { questions: [] } }),
+    });
+    expect(res.status).toBe(400);
+    append(askTool("u1", [Q], "m1"));
+    hub["setEnabled"](SID, true);
+    await owner("Hello?");
+    await waitFor(() => notices().length === 1, 3000, "the warning");
+  });
+
+  test("a call in a subagent's records gets no warning", async () => {
+    await cliCore();
+    append({ ...askTool("u1", [Q], "m1"), isSidechain: true });
+    await owner("Hello?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a call after which the turn was interrupted gets no warning", async () => {
+    await cliCore();
+    append(askTool("u1", [Q], "m1"), { type: "user", isSidechain: false, message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user for tool use]" }] } });
+    await owner("Hello?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a call before a rewind to typed input gets no warning", async () => {
+    await cliCore();
+    append(askTool("u1", [Q], "m1"), humanTyped("something else"));
+    await owner("Hello?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a call made before the session was resumed gets no warning", async () => {
+    append(askTool("u1", [Q], "m1"));
+    await cliCore();
+    await owner("Hello?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a session started through the SDK has no terminal dialog and gets no warning", async () => {
+    await cliCore("sdk-ts");
+    append(askTool("u1", [Q], "m1"));
+    await owner("Hello?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a session under a terminal supervisor gets no warning", async () => {
+    await cliCore();
+    hub["terminals"] = new TerminalRelay({
+      directory: state,
+      known: () => true,
+      connected: () => false,
+      request: async () => ({ session: SID, generation: "one", revision: 1, screen: "screen", status: "running", recoveries: 0 }),
+      show: () => {},
+      warn: () => {},
+    });
+    append(askTool("u1", [Q], "m1"));
+    await owner("Hello?");
+    expect(notices()).toEqual([]);
+  });
+
+  test("a huge transcript prefix neither delays the warning nor is read whole", async () => {
+    const chunk = line({ type: "progress", data: "x".repeat(1024 * 1024) });
+    for (let n = 0; n < PREFIX_BYTES / chunk.length; n++) appendFileSync(transcript, chunk);
+    await cliCore();
+    append(askTool("u1", [Q], "m1"));
+    await owner("Hello?");
+    await waitFor(() => notices().length === 1, 3000, "the warning");
+    expect(notices().length).toBe(1);
   });
 });
 

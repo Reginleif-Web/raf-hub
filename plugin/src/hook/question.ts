@@ -30,6 +30,7 @@ import type { EndedWhy } from "./question-reasons.ts";
 // survive.
 const hookInput = z.object({
   session_id: z.string().min(1),
+  tool_use_id: z.string().optional(),
   tool_input: z.looseObject({ questions: z.array(z.unknown()) }),
 });
 
@@ -73,6 +74,7 @@ async function decide(): Promise<Output | undefined> {
       body: JSON.stringify({
         messagingSocket: process.env.CLAUDE_CODE_MESSAGING_SOCKET,
         session_id: input.session_id,
+        tool_use_id: input.tool_use_id,
         tool_input: input.tool_input,
       }),
       timeout: false,
