@@ -70,7 +70,7 @@ export function routeCallback(u: Update, cfg: Config): CallbackRoute | undefined
 // (`/run [account]`, `/mode [mode]`, `/stop`, `/cleanup`, `/compact`, `/rename`) are
 // one `rig session` call each; `/info` renders `rig info`. `/pwsh`, `/cmd` and
 // `/bash` run their text in a shell in the session's folder.
-export type HubCommand = { name: "run" | "stop" | "cleanup" | "mode" | "info" | "compact" | "rename" | "pwsh" | "cmd" | "bash"; args: string };
+export type HubCommand = { name: "run" | "stop" | "cleanup" | "mode" | "info" | "compact" | "rename" | "pwsh" | "cmd" | "bash" | "terminal"; args: string };
 
 // `/compact <N>` with a token count (333000, 333k, 1.5m) or `auto` asks for the autocompact window: the value
 // (a string rig accepts: digits matching ^[1-9][0-9]*$, or "auto"), `refused` when it is a count that rounds to
@@ -87,7 +87,7 @@ export function autocompactArg(args: string): AutocompactArg | undefined {
   return RIG_WINDOW.test(window) ? { window } : { refused: true };
 }
 
-const HUB_COMMANDS: readonly HubCommand["name"][] = ["run", "stop", "cleanup", "mode", "info", "compact", "rename", "pwsh", "cmd", "bash"];
+const HUB_COMMANDS: readonly HubCommand["name"][] = ["run", "stop", "cleanup", "mode", "info", "compact", "rename", "pwsh", "cmd", "bash", "terminal"];
 
 function isHubCommandName(name: string): name is HubCommand["name"] {
   return HUB_COMMANDS.some(n => n === name);

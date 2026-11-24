@@ -23,9 +23,9 @@ export const rigStopSchema = z.union([
   z.strictObject({ session, stopped: z.literal(true), compacted: z.union([compacted, skipped, compactError]).nullable() }),
 ]);
 export const rigCleanupSchema = z.strictObject({ session, compacted, backup: z.string(), skillsRemoved: z.number().int().nonnegative() });
-export const rigRunSchema = z.strictObject({ session, pid: z.number().int().positive(), mode: modeSchema.nullable(), account: z.number().int().positive().nullable() });
+export const rigRunSchema = z.strictObject({ session, pid: z.number().int().positive(), mode: modeSchema.nullable(), account: z.number().int().positive().nullable(), terminal: z.literal(true).optional() });
 export const rigModeSchema = z.union([
-  z.strictObject({ session, mode: modeSchema, pid: z.number().int().positive() }),
+  z.strictObject({ session, mode: modeSchema, pid: z.number().int().positive(), terminal: z.literal(true).optional() }),
   z.strictObject({ session, mode: modeSchema, changed: z.literal(false) }),
 ]);
 

@@ -11,6 +11,7 @@ const MAX_DETAIL_CHARS = 60;
 // Input fields that tell what a tool call does, best first.
 const DETAIL_FIELDS = ["file_path", "notebook_path", "description", "pattern", "command", "url", "query", "prompt"];
 const CHANNEL_MESSAGE_ID = /<channel\b[^>]*\bmessage_id="(\d+)"/g;
+const CHANNEL_MESSAGE_IDS = /<channel\b[^>]*\bmessage_ids="([\d,]+)"/g;
 // Claude Code's record for Esc: "[Request interrupted by user]", or "… for tool use]".
 const INTERRUPTED = /^\[Request interrupted by user\b/;
 // How the result of a TaskStop call begins.
@@ -233,7 +234,10 @@ function isOurChannel(origin: unknown): boolean {
 // Claude Code wraps each channel message in a <channel …> tag carrying its
 // meta; the plugin wraps an interrupting message the same way.
 function channelSeen(text: string): TranscriptEvent[] {
-  const messageIds = [...text.matchAll(CHANNEL_MESSAGE_ID)].map(m => Number(m[1]));
+  const messageIds = [...new Set([
+    ...[...text.matchAll(CHANNEL_MESSAGE_ID)].map(m => Number(m[1])),
+    ...[...text.matchAll(CHANNEL_MESSAGE_IDS)].flatMap(m => m[1].split(",").map(Number)),
+  ])].filter(id => Number.isSafeInteger(id) && id > 0);
   return messageIds.length ? [{ kind: "channel_seen", messageIds }] : [];
 }
 

@@ -60,6 +60,8 @@ import { featureText, findRig, Rig, rigAction, rigErrorText, runRig, statusText 
 import { confirmationPromptId, MachineOutbox } from "./machine-outbox.ts";
 import { RigEvents, RIG_POLL_MS } from "./rig-events.ts";
 import { hubCommit, RigLifecycle, startedCommit } from "./rig-lifecycle.ts";
+import { TerminalRelay } from "./terminal-relay.ts";
+import { TerminalInbox, transcriptMessageIds } from "./terminal-inbox.ts";
 
 // The queue id prefix of the start notice, "starting the session".
 const LAUNCH_NOTICE = "launch-";
@@ -142,6 +144,7 @@ function botCommands(m: Messages, bashName: string): { command: string; descript
     { command: "cmd", description: m.commandCmd },
     { command: "run", description: m.commandRun },
     { command: "mode", description: m.commandMode },
+    { command: "terminal", description: m.commandTerminal },
     { command: "rename", description: m.commandRename },
     { command: "rig", description: m.commandRig },
   ];
@@ -156,7 +159,7 @@ type Card = {
   // The final version is shown: nothing more to do.
   done: boolean;
   messageId?: number;
-  shown?: Formatted;
+  shown?: Formatted & { buttons?: Button[][] };
   lastEdit: number;
   editing: boolean;
   timer?: ReturnType<typeof setTimeout>;
@@ -181,7 +184,7 @@ type Ending = { actions: number; stopped: boolean; failed: boolean; closing: boo
 // `old` is every connection that could be the window being replaced, taken when the action began: the ones attached
 // to the session and the ones that had not said hello yet (empty for a plain start, which begins with no window).
 // Held items never go to a connection of that set, so a late hello from the old window changes nothing.
-type Launch = { held: Held[]; old: Set<WS>; mode?: PermissionMode; account?: string; timer?: ReturnType<typeof setTimeout>; ending?: Ending };
+type Launch = { held: Held[]; old: Set<WS>; mode?: PermissionMode; account?: string; timer?: ReturnType<typeof setTimeout>; ending?: Ending; terminal?: boolean };
 // How a stop or a cleanup came out for the hold it set.
 type EndingResult = "ended" | "failed" | "not-running";
 // Topic messages of a session waiting to go to its window together.
@@ -387,12 +390,32 @@ export class Hub {
   private disableConfirmations = new Map<string, RigConfirmation>();
 
   private timers: Timers;
+  private terminals?: TerminalRelay;
+  private terminalInbox?: TerminalInbox;
 
   constructor(private opts: HubOptions) {
     this.timers = opts.timers ?? realTimers;
     this.store = new SessionStore(opts.sessionsFile);
     this.log = opts.log;
+    if (opts.rigDir) this.terminals = new TerminalRelay({ directory: join(opts.rigDir, "terminals"),
+      known: sid => Boolean(this.store.get(sid)), watch: sid => this.store.get(sid)?.enabled === true, connected: sid => this.isConnected(sid),
+      show: (sid, text, entities, buttons, generation) => this.upsertCard(sid, `terminal-${sid}-${generation}`, text, entities, true, buttons, true, undefined, "action"),
+      warn: text => this.log.warn(text), timers: this.timers });
     this.outbox = new Outbox(opts.outboxFile, opts.log);
+    if (opts.rigDir) {
+      this.terminalInbox = new TerminalInbox(join(dirname(opts.outboxFile), "terminal-inbox.json"));
+      const cfg = opts.config();
+      for (const [sid, messages] of this.terminalInbox.entries()) {
+        if (!this.store.get(sid)) continue;
+        let seen: number[] = [];
+        const transcript = this.transcriptOf(sid);
+        if (transcript && cfg.groupId) try { seen = transcriptMessageIds(readFileSync(transcript, "utf8"), cfg.groupId); } catch {}
+        this.terminalInbox.seen(seen);
+        const acknowledged = new Set(seen);
+        const allowed = messages.filter(message => !acknowledged.has(message.message_id) && String(message.chat.id) === cfg.groupId && cfg.allowFrom.includes(String(message.from?.id)));
+        if (allowed.length) this.retained.set(sid, allowed.map(message => ({ message })));
+      }
+    }
     this.rig = new Rig({ find: opts.findRig ?? (() => opts.rigDir ? findRig(opts.platform ?? PLATFORM) : undefined), platform: opts.platform ?? PLATFORM,
       run: opts.runRig ?? runRig, warn: text => this.log.warn(text),
       setTimer: (fn, ms) => this.setTimer(fn, ms), clearTimer: timer => this.clearTimer(timer), messages: () => this.m() });
@@ -432,7 +455,7 @@ export class Hub {
           final: c.done,
           done: c.done,
           ...(c.messageId !== undefined ? { messageId: c.messageId } : {}),
-          ...(c.done ? { shown: { text: c.text, entities: c.entities } } : {}),
+          ...(c.done ? { shown: { text: c.text, entities: c.entities, buttons: c.buttons } } : {}),
           ...(c.buttons ? { buttons: c.buttons } : {}),
           lastEdit: 0,
           editing: false,
@@ -503,7 +526,10 @@ export class Hub {
     for (const item of this.outbox.items()) if (item.files) this.fileMessages.set(messageOf(item.id), { errors: [] });
     for (const sid of this.outbox.sessions()) this.spawn(this.pump(sid));
     this.ingestSpool();
-    this.spoolTimer = this.timers.setRepeat(() => this.ingestSpool(), this.opts.spoolScanMs ?? SPOOL_SCAN_MS);
+    this.spoolTimer = this.timers.setRepeat(() => {
+      this.ingestSpool();
+      if (this.botReady && this.terminals) this.spawn(this.terminals.scan());
+    }, this.opts.spoolScanMs ?? SPOOL_SCAN_MS);
     this.typingTimer = this.timers.setRepeat(() => {
       for (const ws of this.conns) if (ws.data.busy) this.showTyping(ws);
     }, this.opts.typingEveryMs ?? TYPING_EVERY_MS);
@@ -1262,7 +1288,7 @@ ${msg.text}`);
 
   private scheduleCardEdit(key: string, card: Card): void {
     if (card.timer || card.editing) return;
-    if (card.shown && sameFormatted(card.shown, card)) {
+    if (card.shown && sameFormatted(card.shown, card) && JSON.stringify(card.shown.buttons ?? []) === JSON.stringify(card.buttons ?? [])) {
       if (card.final && !card.done) {
         card.done = true;
         this.saveCards();
@@ -1290,7 +1316,7 @@ ${msg.text}`);
     if (!this.running || card.messageId === undefined || !this.opts.api) return;
     // The session's text goes first; the card takes a later slot.
     if (this.pumping.size || this.opts.api.floodEndsAt() > this.timers.now()) return this.cardTimer(key, card, this.timers.now());
-    const shownVersion = { text: card.text, entities: card.entities };
+    const shownVersion = { text: card.text, entities: card.entities, buttons: card.buttons };
     const f = cardFormat(shownVersion);
     card.editing = true;
     try {
@@ -1490,11 +1516,11 @@ ${msg.text}`);
     const card = item.card ? this.cards.get(item.card) : undefined;
     if (item.card && card) {
       // The card may have changed while it waited in the queue.
-      const shownVersion = { text: card.text, entities: card.entities };
+      const shownVersion = { text: card.text, entities: card.entities, buttons: card.buttons };
       const f = cardFormat(shownVersion);
       const buttons = card.buttons;
       const replyTo = item.cardReplyTo ? this.cards.get(item.cardReplyTo)?.messageId : undefined;
-      const sent = await this.sendToTopic(api, groupId, sessionId, thread => api.sendMessage(groupId, thread, f.text, true, f.entities, buttons, replyTo));
+      const sent = await this.sendToTopic(api, groupId, sessionId, thread => api.sendMessage(groupId, thread, f.text, item.silent, f.entities, buttons, replyTo));
       card.messageId = sent.message_id;
       card.shown = shownVersion;
       card.lastEdit = this.timers.now();
@@ -1675,6 +1701,7 @@ ${msg.text}`);
           }
           online = wasOnline = true;
           this.botReady = true;
+          if (this.terminals) this.spawn(this.terminals.scan());
           this.rigLifecycle?.ready();
           failures = 0;
         } catch (e) {
@@ -1749,6 +1776,11 @@ ${msg.text}`);
       return;
     }
     if (press?.data.startsWith("x:")) return this.onExecPress(api, press);
+    if (press?.data.startsWith("t:")) {
+      const outcome = this.terminals ? await this.terminals.press(press.data) : "Terminal relay is not installed";
+      await api.answerCallbackQuery(press.id, outcome).catch(error => this.log.warn(`terminal button: ${String(error)}`));
+      return;
+    }
     if (press?.data.startsWith("rig-disable:")) return this.onRigDisablePress(api, press);
     if (press?.data.startsWith("m:")) return this.onModePress(api, press);
     if (press?.data.startsWith(POLL_PREFIX) && cfg.groupId) return this.onPollPress(api, cfg.groupId, press);
@@ -1773,6 +1805,13 @@ ${msg.text}`);
       this.log.info(`message ${m.message_id} replies to ${r.message_id}: ${quote}; fields ${Object.keys(m).join(", ")}`);
     }
     const hubCmd = m.text !== undefined ? hubCommandOf(m.text, this.botUsername) : undefined;
+    if (hubCmd?.name === "terminal") {
+      try {
+        if (!this.terminals) throw new Error("Terminal relay is not installed");
+        await this.terminals.command(route.sessionId, hubCmd.args);
+      } catch (error) { this.notice(route.sessionId, error instanceof Error ? error.message : "Terminal unavailable; start it with /run", "warning"); }
+      return;
+    }
     if (hubCmd) {
       // The messages before the command reach the agent first.
       if (hubCmd.name !== "mode" && hubCmd.name !== "stop") await this.flushBatch(route.sessionId);
@@ -1783,6 +1822,14 @@ ${msg.text}`);
     }
     const rest = await this.toPoll(api, route.sessionId, m);
     if (!rest) return;
+    this.terminalInbox?.add(route.sessionId, rest);
+    if (route.action === "inactive") {
+      if (this.terminals && await this.terminals.running(route.sessionId)) {
+        if (!this.hold(route.sessionId, { message: rest })) this.retainHeld(route.sessionId, [{ message: rest }]);
+        await this.terminals.command(route.sessionId, "");
+        return;
+      }
+    }
     if (route.action === "inactive") return this.toInactive(api, route.sessionId, [rest]);
     await this.deliver(api, route.sessionId, rest);
   }
@@ -1953,6 +2000,7 @@ ${msg.text}`);
       if (this.rerouteBatch(sessionId, ws, messages)) return;
       if (ws.data.reportsSeen) this.reactLater(first.message_id);
       this.send(ws, { type: "inbound", content, meta, ...flag });
+      if (!ws.data.reportsSeen) this.terminalInbox?.seen(messages.map(message => message.message_id));
       for (const message of messages) this.deliveredItems.add(message);
       this.log.info(`message ${first.message_id} in topic ${first.message_thread_id} → session ${sessionId}: ${shapeOf(first, content)}`);
       return;
@@ -1969,7 +2017,8 @@ ${msg.text}`);
       const oldest = this.batchIds.keys().next();
       if (this.batchIds.size > MAX_BATCH_IDS && !oldest.done) this.batchIds.delete(oldest.value);
     }
-    this.send(ws, { type: "inbound", content, meta: baseMeta(first), ...flag });
+    this.send(ws, { type: "inbound", content, meta: { ...baseMeta(first), message_ids: ids.join(",") }, ...flag });
+    if (!ws.data.reportsSeen) this.terminalInbox?.seen(messages.map(message => message.message_id));
     for (const message of messages) this.deliveredItems.add(message);
     this.log.info(`messages ${ids.join(", ")} in topic ${first.message_thread_id} → session ${sessionId}: ${messages.map(kindOfMessage).join(", ")}, ${content.length} chars`);
   }
@@ -2012,6 +2061,7 @@ ${msg.text}`);
   // seen by its first message, so its other messages are cleared with it.
   private seen(messageId: number): void {
     const others = this.batchIds.get(messageId);
+    this.terminalInbox?.seen([messageId, ...(others ?? [])]);
     this.batchIds.delete(messageId);
     for (const id of others ?? []) this.clearTaken(id);
     this.clearTaken(messageId);
@@ -2166,6 +2216,7 @@ ${msg.text}`);
         return this.notice(sessionId, m.modeAlready({ mode }), "info");
       }
       this.store.setLaunchedMode(sessionId, mode, offset);
+      entry.terminal = result.value.terminal;
       this.awaitWindow(sessionId, entry);
     }));
   }
@@ -2317,6 +2368,15 @@ ${msg.text}`);
   private awaitWindow(sessionId: string, entry: Launch): void {
     if (this.launches.get(sessionId) !== entry) return;
     entry.timer = this.setTimer(() => {
+      if (entry.terminal && this.terminals) {
+        this.spawn(this.terminals.running(sessionId).then(running => {
+          if (this.launches.get(sessionId) !== entry) return;
+          if (running) { this.awaitWindow(sessionId, entry); return; }
+          this.abandonLaunch(sessionId, entry);
+          this.notice(sessionId, "Terminal exited before the session connected. Use /terminal to inspect it.", "error");
+        }));
+        return;
+      }
       this.log.warn(`session ${sessionId} did not connect in ${CONNECT_WAIT_MS / MS_PER_SECOND} s; ${entry.held.length} held item(s) retained`);
       this.abandonLaunch(sessionId, entry);
       this.notice(sessionId, this.m().sessionDidNotStart({ seconds: CONNECT_WAIT_MS / MS_PER_SECOND }), "error");
@@ -2365,6 +2425,7 @@ ${msg.text}`);
         return this.notice(sessionId, failureOutcome(result.error, this.m()).text, "error");
       }
       this.store.setLaunchedMode(sessionId, undefined, undefined);
+      entry.terminal = result.value.terminal;
       this.awaitWindow(sessionId, entry);
     }));
   }

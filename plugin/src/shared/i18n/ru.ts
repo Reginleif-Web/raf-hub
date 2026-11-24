@@ -19,6 +19,7 @@ export const ru: Messages = {
   commandStop: "Завершить сессию",
   commandCleanup: "Сжать контекст, убрать накопившиеся скиллы и завершить сессию",
   commandMode: "Показать или сменить режим разрешений",
+  commandTerminal: "Экран и ввод терминала; /terminal text <ответ>",
   commandPwsh: "Команда в PowerShell в папке сессии",
   commandCmd: "Команда в cmd в папке сессии",
   commandBash: ({ shell }) => `Команда в ${shell} в папке сессии`,

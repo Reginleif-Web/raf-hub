@@ -13,6 +13,7 @@ import { memLogger, must, offlineApi, tempDir } from "./helpers.ts";
 import { manualClock, turn } from "./manual-clock.ts";
 import { en } from "../src/shared/i18n/en.ts";
 import { platformFor } from "../src/shared/platform.ts";
+import { TerminalRelay, type TerminalSnapshot } from "../src/hub/terminal-relay.ts";
 
 // Synthetic ids. No real rig, child process, Telegram connection or wall clock.
 const GROUP = "-1001";
@@ -73,6 +74,52 @@ function fixture(extra: Partial<HubOptions> = {}) {
   return { hub, options, api, dir, clock, texts, order, exec, answers, menus, removed, update, intake, track,
     offline: (next: boolean) => { offline = next; }, output: (next: RigOutput) => { output = next; } };
 }
+
+test("terminal commands and buttons work without an agent window and reject strangers", async () => {
+  const f = fixture();
+  const actions: unknown[] = [];
+  const frames: { text: string; data: string }[][][] = [];
+  const screen: TerminalSnapshot = { session: "session", generation: "one", revision: 1, screen: "Accessing workspace: example", status: "running", recoveries: 0 };
+  f.hub["terminals"] = new TerminalRelay({ directory: f.dir, known: sid => sid === "session", connected: () => false,
+    request: async (_sid, input) => { if (input) actions.push(input); return screen; },
+    show: (_sid, _text, _entities, buttons) => { frames.push(buttons); }, warn: () => {} });
+  await f.update("/terminal", STRANGER, TOPIC);
+  expect(frames).toEqual([]);
+  await f.update("/terminal", USER, TOPIC);
+  expect(frames).toHaveLength(1);
+  const data = frames[0].flat().find(button => button.text === "Enter")!.data;
+  await f.hub["handleUpdate"](f.api, buttonPress({ chatId: GROUP, fromId: STRANGER, messageId: 1, data }));
+  expect(actions).toEqual([]);
+  await f.hub["handleUpdate"](f.api, buttonPress({ chatId: GROUP, fromId: USER, messageId: 1, data }));
+  expect(actions).toEqual([{ generation: "one", revision: 1, key: "enter" }]);
+});
+
+test("refreshing a terminal keyboard updates buttons even when its screen text is unchanged", async () => {
+  const f = fixture({ cardEditMs: 0, cardGapMs: 0 });
+  const oldButtons = [[{ text: "Enter", data: "old-frame" }]];
+  const newButtons = [[{ text: "Enter", data: "new-frame" }]];
+  const edits: unknown[] = [];
+  f.api.editMessageText = async (_group, _id, _text, _entities, buttons) => { edits.push(buttons); };
+  f.hub["cards"].set("session:terminal", { text: "Same screen", entities: [], final: true, done: true, messageId: 1,
+    shown: { text: "Same screen", entities: [] }, buttons: oldButtons, lastEdit: 0, editing: false });
+  f.hub["upsertCard"]("session", "terminal", "Same screen", [], true, newButtons, true);
+  await f.clock.advance(0);
+  expect(edits).toEqual([newButtons]);
+});
+
+test("a hub restart restores messages waiting behind a startup prompt", async () => {
+  const f = fixture({ rigDir: "/unused-rig" });
+  f.hub["terminals"] = new TerminalRelay({ directory: f.dir, known: () => true, connected: () => false,
+    request: async () => ({ session: "session", generation: "one", revision: 1, screen: "Startup question", status: "running", recoveries: 0 }),
+    show: () => {}, warn: () => {} });
+  await f.update("Continue the existing task", USER, TOPIC);
+  const restarted = f.track(new Hub(f.options));
+  expect(restarted["retained"].get("session")?.length).toBe(1);
+  const pending = restarted["terminalInbox"]!.entries()[0][1][0];
+  restarted["seen"](pending.message_id);
+  const again = f.track(new Hub(f.options));
+  expect(again["retained"].get("session")).toBeUndefined();
+});
 
 test("General routes only allowed machine commands and preserves a session topic destination", async () => {
   const f = fixture();

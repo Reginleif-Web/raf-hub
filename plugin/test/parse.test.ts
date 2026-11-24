@@ -271,6 +271,11 @@ describe("topic messages reaching the agent", () => {
     expect(parseRecord(blocks)).toEqual([{ kind: "channel_seen", messageIds: [7, 8] }]);
   });
 
+  test("a batched channel prompt durably acknowledges every original message", () => {
+    const content = tag(7, "a and b").replace('message_id="7"', 'message_id="7" message_ids="7,8"');
+    expect(parseRecord({ ...userBase, isMeta: true, origin: TG, message: { role: "user", content } })).toEqual([{ kind: "channel_seen", messageIds: [7, 8] }]);
+  });
+
   test("a channel message absorbed mid-turn is seen too", () => {
     const rec = { type: "attachment", isSidechain: false, attachment: { type: "queued_command", prompt: tag(4841, "\u0438 \u0435\u0449\u0451"), commandMode: "prompt", origin: TG } };
     expect(parseRecord(rec)).toEqual([{ kind: "channel_seen", messageIds: [4841] }]);

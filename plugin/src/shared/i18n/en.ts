@@ -21,6 +21,7 @@ export const en = {
   commandStop: "End the session",
   commandCleanup: "Compact the context, remove accumulated skills and end the session",
   commandMode: "Show or change the permission mode",
+  commandTerminal: "Remote terminal screen and input; /terminal text <answer>",
   commandPwsh: "Run a command in PowerShell in the session folder",
   commandCmd: "Run a command in cmd in the session folder",
   commandBash: ({ shell }: { shell: string }) => `Run a command in ${shell} in the session folder`,

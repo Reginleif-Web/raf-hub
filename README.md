@@ -88,6 +88,34 @@ window C ─┘  (one per window)            └─ topic "proj · session B"
 
 ## How to use
 
+### Remote terminal (raf-hub)
+
+Install the optional terminal supervisor once with Node.js 22 or newer:
+`npm ci --prefix terminal`. Rig 0.7.15 or newer then uses it for new Telegram-enabled
+session launches. The supervisor uses a real PTY (ConPTY on Windows) and stays alive
+independently of the hub. Sessions already running in an external terminal move to
+the supervisor only when stopped and resumed; do not start a duplicate on their transcript.
+
+`/terminal` shows the current terminal screen in the session topic, including startup
+trust and channel dialogs that precede the plugin. The screen has arrow, Enter, Esc,
+Tab, Backspace, Ctrl+C, Text and refresh buttons. Press Text on the displayed screen,
+then `/terminal text <answer>` to paste literal text; press Enter separately to submit it. Ordinary topic
+messages still go to the agent. Unknown terminal menus can be operated with the same
+controls. Tool permission prompts keep their dedicated Allow / Deny buttons.
+
+Input is bound to the supervisor generation and screen revision. Duplicate or stale
+buttons do not become input to another dialog; refresh with `/terminal` when asked.
+Only the configured group's `allowFrom` users can operate it. Startup messages are
+kept on disk until the plugin reports that the agent saw them. A hub restart reconnects
+to the existing supervisor rather than starting another Claude.
+
+The supervisor can close a rendered `AskUserQuestion` menu only when that exact
+question already has a result in the transcript. It never selects an answer itself.
+Other menus are shown to the owner. Browser and OS dialogs are not terminal menus:
+use a supported login link on the phone for authentication; do not send passwords or
+tokens as ordinary chat messages. The station must be running and the hub's Windows
+Scheduled Task currently runs after the configured user logs in.
+
 A Claude Code window started in a terminal writes to Telegram by itself. The topic `<project> · <session name>`
 appears when the agent first writes to it. Say in the session "write to me in Telegram". The agent calls
 `tg_enable` and creates the topic at once. Say that you do not need Telegram: the agent calls `tg_disable`.
@@ -191,6 +219,9 @@ All six session actions run asynchronously. While rig reports `session-waiting`,
   shown. There are the buttons "✅ Allow" / "❌ Deny". The answer goes to the session as if
   you pressed it in the terminal. You can also answer in the terminal, and then the buttons do nothing. The buttons
   obey only users in `allowFrom`. Claude Code does not give channels "Always allow".
+  These buttons are the supported way to approve or deny a tool call from Telegram; the agent does not approve
+  on your behalf from a text message. With the optional terminal supervisor, startup trust and channel-registration
+  prompts can be answered through `/terminal`; otherwise they require the local terminal.
 - An agent question with options (`AskUserQuestion`), when the mode is on, arrives only in the topic, with
   option buttons, "✏️ Own option" and "✖️ Cancel". In the terminal it shows "Waiting for an answer
   in Telegram" at that time. Any message in the topic while the poll is open is a custom answer (commands work
