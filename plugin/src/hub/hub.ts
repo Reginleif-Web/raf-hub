@@ -266,6 +266,9 @@ const spoolItems = z.array(z.union([sendFilesMessage, sendMessage.extend({ type:
 // Delivery cannot work until the user fixes the setup: no token, no groupId,
 // the bot is not in the group or may not write there.
 class SetupError extends Error {}
+// Thrown by what would hand a topic message to the agent after the stopping hub's last flush. The message is
+// then not handled: the poller leaves its offset, and the next hub gets the message from Telegram again.
+class DeliveryClosedError extends Error {}
 
 // A queued file copy vanished from disk: retrying cannot help.
 class LostFileError extends Error {}
@@ -394,6 +397,9 @@ export class Hub {
   private featureRefresh: Promise<void> | undefined;
   private featureRefreshAgain = false;
   private updatesInFlight = 0;
+  // Set by stop() right after its last check that no batch waits; from then on no message may start a batch,
+  // an answer group, a hold or a launch.
+  private deliveryClosed = false;
   // Fire-and-forget work still running, and what the hub has taken in so far: the tests' proof that it has handled all that was sent to it.
   private spawned = new Set<Promise<unknown>>();
   private messagesFrom = new WeakMap<WS, number>();
@@ -563,18 +569,26 @@ export class Hub {
     this.clearTimer(this.rigTimer);
     // Polling stops first, so no batch starts after the flush.
     this.abort.abort();
-    // Waiting answers answer at once, before the polls go to the terminal.
-    await Promise.all([...this.answerGroups.keys()].map(key => this.takeAnswer(key)));
+    // Words waiting for the last question of a poll answer it at once, and so do the ones that wait for a
+    // question already over (they go on to the agent). Words waiting for an earlier question would only open
+    // the next question, which the next hub cannot take: the poll ends below and they go to the agent.
+    await Promise.all([...this.answerGroups]
+      .filter(([, g]) => g.poll.done || g.poll.index !== g.index || g.index === g.poll.questions.length - 1)
+      .map(([key]) => this.takeAnswer(key)));
+    // The next hub cannot answer an open poll, and a terminal dialog the owner cannot see must not open:
+    // every poll is refused with a request to ask again, the waiting ones too. This ends them all in this
+    // tick, so the words of the answers still waiting reach the batches before the flush below.
+    const refusal: QuestionDecision = { decision: "deny", reason: askAgainReason("hubStopping") };
+    const refused = [...new Set([...this.polls.values()].map(p => p.sessionId))].map(sid => this.endPolls(sid, refusal, this.m().pollAskedAgain).settled);
     // Waiting batches go at once, while the windows are still connected; an
     // update handled meanwhile may start one more.
     while (this.batches.size || this.batchSends.size) {
       await Promise.all([...this.batches.keys(), ...this.batchSends.keys()].map(sid => this.flushBatch(sid)));
     }
+    // Nothing is awaited between the last check above and this line: a message that comes later is not handled.
+    this.deliveryClosed = true;
     this.batchIds.clear();
-    // The next hub cannot answer an open poll, and a terminal dialog the owner cannot see must not open:
-    // every poll is refused with a request to ask again, the waiting ones too.
-    const refusal: QuestionDecision = { decision: "deny", reason: askAgainReason("hubStopping") };
-    await Promise.allSettled([...new Set([...this.polls.values()].map(p => p.sessionId))].map(sid => this.endPolls(sid, refusal, this.m().pollAskedAgain).settled));
+    await Promise.allSettled(refused);
     // A question still being sent shows the outcome right after its send.
     await Promise.allSettled([...this.questionSends]);
     if (this.idleTimer) this.clearTimer(this.idleTimer);
@@ -647,6 +661,11 @@ export class Hub {
       const { messagingSocket, session_id: hookSession, tool_input, tool_use_id } = r.data;
       const sessionId = this.questionSession(messagingSocket, hookSession);
       if (!this.store.get(sessionId)?.enabled) return Response.json({ decision: "none" });
+      // A stopping hub opens no poll: the next hub could not answer it.
+      if (!this.running) {
+        this.takeCall(sessionId, tool_use_id);
+        return Response.json({ decision: "deny", reason: askAgainReason("hubStopping") } satisfies QuestionDecision);
+      }
       // The session is being stopped or restarted and no window can take the poll. With the mode on the owner
       // reads Telegram, so the agent is denied, not left to a dialog nobody sees.
       if (this.isStarting(sessionId)) {
@@ -1085,6 +1104,11 @@ ${msg.text}`);
     return on;
   }
 
+  // The mode of a session whose owner wrote in its topic (a message or a command that runs) is on.
+  private turnModeOn(sessionId: string): void {
+    if (this.store.get(sessionId)?.enabled === false) this.setEnabled(sessionId, true);
+  }
+
   private pushState(sessionId: string): void {
     const ws = this.connOf(sessionId);
     if (!ws) return;
@@ -1183,7 +1207,15 @@ ${msg.text}`);
     ids.delete(toolUseId);
     ids.add(toolUseId);
     calls.set(sessionId, ids);
-    if (ids.size <= MAX_CALL_IDS) return;
+    this.trimCalls(calls, sessionId);
+  }
+
+  // Brings the session's set in `calls` back to MAX_CALL_IDS, oldest first, never dropping the id of an open poll
+  // of the session. Runs whenever an id is added and whenever a poll ends, since ids kept only because their
+  // polls were open stay over the bound until then.
+  private trimCalls(calls: Map<string, Set<string>>, sessionId: string): void {
+    const ids = calls.get(sessionId);
+    if (!ids || ids.size <= MAX_CALL_IDS) return;
     const open = new Set(this.pollsOf(sessionId).map(p => p.toolUseId));
     for (const old of ids) {
       if (ids.size <= MAX_CALL_IDS) break;
@@ -1271,6 +1303,8 @@ ${msg.text}`);
     p.done = true;
     this.polls.delete(p.key);
     this.forgetDialogs(p.sessionId);
+    this.trimCalls(this.taken, p.sessionId);
+    this.trimCalls(this.warnedDialogs, p.sessionId);
     this.catchUps.get(p.key)?.();
     const flushed = this.takeAnswer(p.key);
     if (advance) this.startNext(p.sessionId);
@@ -1383,8 +1417,16 @@ ${msg.text}`);
     const { text } = item;
     const buttons = outcome === undefined ? questionButtons(this.m(), p) : undefined;
     const body = outcome === undefined ? text : `${text}\n\n${outcome}`;
-    const sent = await this.sendToTopic(api, groupId, sessionId, thread => api.sendMessage(groupId, thread, body, item.silent, item.entities, buttons));
-    p.messageIds[i] = sent.message_id;
+    const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
+    const mine = { index: i, settled };
+    p.sending = mine;
+    try {
+      const sent = await this.sendToTopic(api, groupId, sessionId, thread => api.sendMessage(groupId, thread, body, item.silent, item.entities, buttons));
+      p.messageIds[i] = sent.message_id;
+    } finally {
+      if (p.sending === mine) p.sending = undefined;
+      settle();
+    }
     if (outcome === undefined && p.outcomes[i] !== undefined) await this.showOutcome(p, i);
   }
 
@@ -1901,6 +1943,8 @@ ${msg.text}`);
         try {
           await this.handleUpdate(api, u);
         } catch (e) {
+          // Not handled: the offset stays, and the next hub gets the update again.
+          if (e instanceof DeliveryClosedError) return;
           this.log.error(`update ${u.update_id} failed: ${e}`);
         }
         this.savePollOffset(offset);
@@ -1977,8 +2021,13 @@ ${msg.text}`);
       }
       return this.onHubCommand(route.sessionId, hubCmd, m);
     }
+    // A message in the topic turns the mode on the moment it arrives, never at its delivery: a message that waits
+    // in a batch, is held, replayed or handed over must not undo a tg_disable that came after it.
+    this.turnModeOn(route.sessionId);
     const rest = await this.toPoll(api, route.sessionId, m);
     if (!rest) return;
+    // Before the message is kept on disk: the next hub would otherwise get it from there and from Telegram.
+    this.assertDeliveryOpen();
     this.terminalInbox?.add(route.sessionId, rest);
     if (route.action === "inactive") {
       if (this.terminals && await this.terminals.running(route.sessionId)) {
@@ -2010,7 +2059,20 @@ ${msg.text}`);
       const plain = withoutInterrupt(m);
       return plain.text === "" ? undefined : plain;
     }
-    const shownAs = p.messageIds[p.index];
+    let shownAs = p.messageIds[p.index];
+    if (shownAs === undefined && p.sending?.index === p.index && !p.done) {
+      // The question is on its way: its id is not known yet, and a reply may already be here. Whether the message
+      // came after the question is for the ids to say, so wait for the send (a failed one leaves no id: ordinary message).
+      const index = p.index;
+      const resume = this.holdAnswer(p.key);
+      try {
+        await p.sending.settled;
+      } finally {
+        resume();
+      }
+      if (p.done || p.index !== index) return m;
+      shownAs = p.messageIds[index];
+    }
     if (shownAs === undefined || m.message_id <= shownAs || p.done) return m;
     const index = p.index;
     const resume = this.holdAnswer(p.key);
@@ -2088,14 +2150,20 @@ ${msg.text}`);
   // Messages for a session without a window: kept for its start under way,
   // else `rig session run` starts it with them held until it connects.
   private async toInactive(_api: TelegramApi, sessionId: string, messages: Message[]): Promise<void> {
+    this.assertDeliveryOpen();
     const rest = messages.filter(m => !this.hold(sessionId, { message: m }));
     if (!rest.length) return;
     return this.launch(sessionId, undefined, rest.map(m => ({ message: m })));
   }
 
+  private assertDeliveryOpen(): void {
+    if (this.deliveryClosed) throw new DeliveryClosedError("the hub has stopped");
+  }
+
   // A topic message joins the session's waiting batch; a "!" message sends it
   // and starts its own.
   private async deliver(api: TelegramApi, sessionId: string, m: Message): Promise<void> {
+    this.assertDeliveryOpen();
     if (this.hold(sessionId, { message: m })) return;
     if (!this.connOf(sessionId)) return this.toInactive(api, sessionId, [m]);
     // Held messages are still being handed over: this one goes after the
@@ -2171,7 +2239,6 @@ ${msg.text}`);
       this.log.info(`session ${sessionId} has no window for ${what}`);
       return this.toInactive(api, sessionId, messages);
     }
-    this.setEnabled(sessionId, true);
     // Only the first message of a batch can interrupt: a "!" message starts
     // its own batch. The agent gets the text without the "!".
     const interrupt = isInterrupt(first);
@@ -3000,6 +3067,7 @@ ${msg.text}`);
     const cwd = rec?.cwd ?? (this.opts.projectsDir ? sessionCwd(sessionId, this.opts.projectsDir) : undefined);
     if (!cwd) return this.notice(sessionId, this.m().execNoCwd, "warning");
     this.log.info(`/${name} for session ${sessionId}, message ${m.message_id}`);
+    this.turnModeOn(sessionId);
     this.execs.command(sessionId, name, text, cwd, { chatId: String(m.chat.id), messageId: m.message_id, date: m.date });
   }
 
@@ -3053,7 +3121,6 @@ ${msg.text}`);
       this.releaseHeld(sessionId, [{ inbound }]);
       return;
     }
-    this.setEnabled(sessionId, true);
     this.send(ws, { type: "inbound", content: inbound.content, meta: inbound.meta });
     this.deliveredItems.add(inbound);
     inbound.onSent();

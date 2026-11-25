@@ -49,7 +49,7 @@ itself with a refusal (the agent is told to ask again if the answer is still nee
 marked "⌛ The poll ended on the terminal side (Esc, the time limit or a restart). If the agent still waits for an
 answer, it may be a dialog in the terminal: /terminal shows it here, or answer it there", and the buttons are removed.
 The hub cannot tell the time limit from Esc or a restart (it only sees the request abort), so the one line names all
-three and says what to do. A graceful stop of the hub (`Hub.stop`) denies the polls, see the table. Pressing a button
+three and says what to do. A graceful stop of the hub (`Hub.stop`) denies the polls, see "Graceful stop" below. Pressing a button
 of an ended poll answers "The poll is outdated" and removes the buttons, as with permissions.
 
 **Several questions.** One call can have up to 4 questions. They arrive one by one: the next one comes
@@ -116,7 +116,9 @@ poll that is not shown yet counts as outdated.
 `POST /question` to the hub with `{messagingSocket, session_id, tool_input}` and waits for the answer (`fetch` with
 `timeout: false`, otherwise Bun drops an idle request after 5 minutes). The wait ends by itself in two
 cases, even if Claude Code never killed the hook: at the hook's own limit, one minute less than `timeout`
-(`src/hook/question-limits.ts`), and when the parent process is gone (checked every 2 s with the signal
+(`QUESTION_DEADLINE_MS`, `src/hook/question-limits.ts`: 86 340 000 ms against `timeout` 86400 s = 86 400 000 ms in
+`hooks.json`, a margin of 60 s; the packaging test "the hook's deadline is a little under its timeout in hooks.json"
+reads both and fails when the deadline is not below the timeout or the margin is not 60 s), and when the parent process is gone (checked every 2 s with the signal
 `kill(pid, 0)`, without starting processes). Then the hook aborts the request. The hub answers
 `{decision: "allow", answers}`, `{decision: "deny", reason}` or `{decision: "none"}`. The hook prints the
 decision for allow and deny (it waits for the stdout write to finish before exiting, so a long answer is not
@@ -206,7 +208,7 @@ outlive the hub's knowledge of it.
 | "✖️ Cancel" button | deny, cancelled (the shown poll only; the next waiting poll is shown) | poll cancelled |
 | A message with "!" | deny, cancelled (all polls of the session) | poll cancelled |
 | The window moves to another session and no other window holds this one | deny, ask again (`windowGone`), all polls of the session; the dialog state of the session is released | closed, agent asked to ask again |
-| Hub stops gracefully | deny, ask again (`hubStopping`), all polls | closed, agent asked to ask again |
+| Hub stops gracefully | deny, ask again (`hubStopping`), all polls; a `/question` that comes while the hub stops gets the same at once | closed, agent asked to ask again |
 | The window of the session is gone, or a button is pressed with no connected window | deny, ask again (`windowGone`) | same |
 | Telegram did not accept the poll message | deny, plain-text advice (`NOT_SHOWN_REASON`): do not call the tool again, write the question as plain text and end the turn; the next poll is shown | the existing "Telegram rejected" notice; the poll message was never sent, so it has no outcome line |
 | Hub crash or restart without a graceful stop after acceptance | deny, ask again (printed by the hook: connection lost) | nothing (the hub is gone) |
@@ -226,11 +228,35 @@ is the one end that could repeat on every new call with no outside event, so it 
 write the question as plain text.
 
 **A text answer waiting when the poll ends.** An owner's text that the hub took as the answer to a question (it waits in
-its answer group for the quiet time of a batch) must reach the agent before any later message of the owner, whatever ends
-the poll. `finishPoll`, the one place every poll ends, flushes the group of the poll at every end that is not the answer
-itself (cancel, a closed or lost window, the hook's abort, the mode turned off, `notShown`, the bulk ends of the session);
-the advance to the next question of a multi-question poll flushes it too. A flush of a group that is already gone is a
-no-op.
+its answer group for the quiet time of a batch) must reach the agent, whatever ends the poll, and before any later
+message of the owner in the same session's flow of messages. `finishPoll`, the one place every poll ends, flushes the
+group of the poll at every end that is not the answer itself (cancel, a closed or lost window, the hook's abort, the mode
+turned off, `notShown`, the bulk ends of the session); the advance to the next question of a multi-question poll flushes
+it too. A flush of a group that is already gone is a no-op. This promises no order against the answers of later polls:
+an answer goes back to the agent as the result of its tool call, a message goes through the channel, and Claude Code reads
+a channel message only after the tool result, so the agent sees the answers of a poll before the words that ended an
+earlier one.
+
+**A reply to a question that is still being sent.** A reply belongs to the question only if it came after the question
+message, which the hub tells by message ids. While the question message is on its way its id is not known yet, so a
+message that arrives meanwhile waits for the send to settle (answer groups stand still, as during a photo download) and is
+then attributed by the id; if the send failed there is no id and the message is an ordinary one. If the poll ended or moved
+to the next question in the meantime, the message goes to the agent.
+
+**Graceful stop.** `Hub.stop` runs in this order, and a message that reaches delivery after the last step is not handled:
+1. The hub stops taking updates, and a `/question` of a session with the mode on is refused at once with the
+   `hubStopping` advice (the next hub could not answer it).
+2. Words waiting as an answer to the last question of a poll answer it; so do words waiting for a question that is already
+   over (they go on to the agent). Words waiting for an earlier question would only open the next question, which the
+   next hub cannot take, so they are not applied: the poll ends in step 3 and the words go to the agent.
+3. Every other poll ends in the same tick with the `hubStopping` refusal, the waiting ones too; the words of the groups
+   they hold go into batches.
+4. Batches are flushed, in a loop, while the windows are still connected.
+5. Delivery is closed, with nothing awaited between the last empty check of the batches and the closing. After that a
+   message that would start a batch, an answer group, a hold or a launch is not handled: the poller does not save the
+   offset for its update, and the next hub gets the update from Telegram again. Commands already executed are not
+   repeated by the next hub (only delivery throws that way).
+Stop does not wait for downloads or commands that are still running, except those a batch send already needs.
 
 Known facts about the terminal side, not more: the hub sees an Esc or a killed hook only as an aborted request, so it cannot
 tell the time limit, Esc and a restart apart; `sendInterrupt` writes a prompt to the window's messaging socket and is
@@ -269,7 +295,8 @@ replaced by one last line, "…and N more" (`dialogMore`), that counts them.
 
 **Bounds and release of the dialog state.** The set of calls the hub took (`taken`) and the set of calls already warned
 about (`warnedDialogs`) hold the newest 200 call ids per session (the same number as the ids of one batch). Beyond
-that the oldest ids go, but never the id of a poll that is still open. The state of a session (its polls, `taken`,
+that the oldest ids go, but never the id of a poll that is still open (`trimCalls`). Ids kept only because their polls
+were open stay over the bound, so the same trim runs again whenever a poll ends, for both sets. The state of a session (its polls, `taken`,
 `anonymousAsk`, `warnedDialogs`) is released by one function in two cases: the last window of the session closes, and a
 window moves to another session while no other window holds the first (all polls of the first end with the
 `windowGone` refusal, as for a close). A resume of the same session id ends nothing, and neither does a window whose

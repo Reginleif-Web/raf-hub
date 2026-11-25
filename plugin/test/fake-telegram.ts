@@ -39,6 +39,7 @@ export class FakeTelegram {
   private blackHole: TCPSocketListener<undefined>;
   private delays = new Map<string, number>();
   private holds = new Map<string, Promise<void>>();
+  private lateHolds = new Map<string, Promise<void>>();
   private deletedTopics = new Set<number>();
   files = new Map<string, { path: string; body: Uint8Array }>();
   // Paths of the file downloads the server has received, in order.
@@ -120,6 +121,14 @@ export class FakeTelegram {
   holdNext(method: string): () => void {
     let release = () => {};
     this.holds.set(method, new Promise<void>(resolve => { release = resolve; }));
+    return release;
+  }
+
+  // The next call of `method` is carried out at once (a sent message gets its id), but the response stays
+  // on the way until the returned function is called, like a slow network after the server did its part.
+  holdNextResponse(method: string): () => void {
+    let release = () => {};
+    this.lateHolds.set(method, new Promise<void>(resolve => { release = resolve; }));
     return release;
   }
 
@@ -206,6 +215,16 @@ export class FakeTelegram {
       );
     }
 
+    const response = await this.answer(method, params);
+    const late = this.lateHolds.get(method);
+    if (late) {
+      this.lateHolds.delete(method);
+      await late;
+    }
+    return response;
+  }
+
+  private async answer(method: string, params: Params): Promise<Response> {
     switch (method) {
       case "getUpdates":
         return this.getUpdates(params);

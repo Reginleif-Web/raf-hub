@@ -18,10 +18,11 @@
 //  - The hub accepted the poll (QUESTION_ACCEPTED_HEADER, which goes out at
 //    once): deny, whatever the persisted mode says.
 //  - Otherwise, with the persisted mode on: deny.
-//  A lost connection and the hook's limit ask for the question again: each
-//  needs an outside event per round. An end that would repeat by itself (a hub
-//  not reached, an error status, an unreadable answer, "none" with the mode on)
-//  gets the plain-text reason, so the agent never loops.
+//  A lost connection after acceptance and the hook's limit ask for the question
+//  again: each needs an outside event per round. An end that would repeat by
+//  itself (a hub not reached, an error status, an unreadable answer, a response
+//  cut off before the acceptance header, "none" with the mode on) gets the
+//  plain-text reason, so the agent never loops.
 //  - Otherwise print nothing.
 import { z } from "zod";
 import { isAlive } from "../shared/process-alive.ts";
@@ -105,7 +106,9 @@ async function decide(): Promise<Output | undefined> {
   try {
     body = await res.text();
   } catch {
-    return technicalEnd(timedOut ? "timeLimit" : "connectionLost");
+    // Asking again is for a hub that took the poll. A response cut off before the acceptance header is a hub
+    // that never took it (or an older one), and the same cut would repeat by itself: the plain-text reason.
+    return technicalEnd(timedOut ? "timeLimit" : accepted ? "connectionLost" : "notTaken");
   }
   let decision;
   try {

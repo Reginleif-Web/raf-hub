@@ -50,7 +50,9 @@ from the phone when away from the computer.
    - on a session change the plugin tells the hub its title and the window's entrypoint. The plugin takes the mode
      from the hub, which applies the same rule as on hello;
    - it turns on automatically when the user writes in the session's topic — without any command
-     in the session itself.
+     in the session itself. The mode turns on the moment the message (or a command that runs) arrives at the hub, never
+     at its delivery: a message that waits in a batch, is held, replayed or handed over must not undo a `tg_disable`
+     that came after it.
 5. **What goes to the topic:**
    - intermediate agent text during the work — **without a notification** (`disable_notification`);
    - a question to the user and a task-completion message — **with a notification**, the whole text.
@@ -196,7 +198,9 @@ goes into the topic name when it is created.
   during startup or a mode restart are joined the same way: consecutive ones go as one batch; a batch waiting during that
   time takes its place among them in order of arrival. If the window closed while the batch was waiting, its
   messages go as to an inactive session (hold for launch, launch, or say "not
-  active"). On stop, the hub first stops taking updates, then sends all waiting batches;
+  active"). On stop, the hub first stops taking updates, then sends all waiting batches, then closes delivery: a
+  message that would reach delivery after that is not handled (its offset is not saved), see `questions-design.md`,
+  "Graceful stop";
 - a message with no content (a service message) → ignore; the names of its fields go to the log, so a new kind of
   message is visible; every delivered one is a line in the log: number, topic, session, kind, length and formatting types,
   without the text.

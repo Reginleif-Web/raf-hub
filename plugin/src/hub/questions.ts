@@ -68,6 +68,9 @@ export type Poll = {
   index: number;
   checked: Set<number>;
   messageIds: (number | undefined)[];
+  // The question being sent right now, and a promise that settles when its send ends, with an id or without. A
+  // message that came meanwhile is told apart from the question only by message ids, so it waits for this.
+  sending?: { index: number; settled: Promise<void> } | undefined;
   outcomes: (string | undefined)[];
   // Topic messages taken as answers: their ✍ comes off once the agent has them.
   taken: number[];

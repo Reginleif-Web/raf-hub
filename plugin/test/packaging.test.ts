@@ -539,7 +539,8 @@ describe("AskUserQuestion hook", () => {
       expect(await runQuestion(port, INPUT, limit)).toEqual({ status: 0, stdout: "" });
     });
 
-    test("a response cut off before its body ends denies with the ask-again reason when the mode is on", async () => {
+    // Without the acceptance header the hub never took the poll, so asking again would meet the same cut: no loop.
+    test("a response cut off before its body ends and before acceptance denies with the plain-text reason when the mode is on", async () => {
       const port = await freePort();
       // Raw HTTP: the headers (no acceptance header) and one chunk go out, then the socket closes mid-body.
       const listener = Bun.listen({
@@ -556,7 +557,7 @@ describe("AskUserQuestion hook", () => {
         },
       });
       try {
-        expectAskAgain(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
+        expectUnreachable(denyOf((await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(true) })).stdout));
         expect(await runQuestion(port, INPUT, { TELEGRAM_HUB_STATE_DIR: stateWithMode(false) })).toEqual({ status: 0, stdout: "" });
       } finally {
         listener.stop(true);

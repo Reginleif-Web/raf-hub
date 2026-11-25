@@ -177,6 +177,16 @@ async function startHub(o: StartOptions = {}): Promise<void> {
 // Resolves when the hub has handled everything sent so far: use it instead of a sleep before "nothing happened".
 const settle = () => settled(hub, { fake });
 
+// The offset a hub saved in its poll-offset file, if it saved a readable one.
+const savedSchema = z.object({ botId: z.number(), offset: z.number() });
+const savedOffset = (file: string) => {
+  try {
+    return savedSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+  } catch {
+    return undefined;
+  }
+};
+
 type Clock = ReturnType<typeof manualClock>;
 
 // A test that drives a hub timer runs the hub on a manual clock; every clock is disposed after its test.
@@ -434,6 +444,47 @@ describe("interactive windows", () => {
     await c.nextNew("inbound");
     expect(new SessionStore(STORE_FILE()).get("s1")?.enabled).toBe(true);
     expect(new SessionStore(STORE_FILE()).get("s1")?.disabledByUser).toBeUndefined();
+  });
+
+  test("a topic message turns the mode on when it arrives, not when its batch is delivered", async () => {
+    const clock = newClock();
+    await startHub({ timers: clock });
+    const c = await enabled("s1", "T");
+    await req(c, { op: "disable" });
+    fake.pushUpdate(topicMsg({ chatId: GROUP, threadId: 100, fromId: ME, text: "back" }));
+    await updatesTaken();
+    expect(new SessionStore(STORE_FILE()).get("s1")?.enabled).toBe(true);
+    expect(new SessionStore(STORE_FILE()).get("s1")?.disabledByUser).toBeUndefined();
+    await closeBatch(clock);
+    await c.next("inbound", m => m.content === "back");
+  });
+
+  test("a message that waited in its batch when the agent turned the mode off does not turn it back on", async () => {
+    const clock = newClock();
+    await startHub({ timers: clock });
+    const c = await enabled("s1", "T");
+    fake.pushUpdate(topicMsg({ chatId: GROUP, threadId: 100, fromId: ME, text: "before the off" }));
+    await updatesTaken();
+    await req(c, { op: "disable" });
+    expect(new SessionStore(STORE_FILE()).get("s1")).toMatchObject({ enabled: false, disabledByUser: true });
+    await closeBatch(clock);
+    await c.next("inbound", m => m.content === "before the off");
+    expect(new SessionStore(STORE_FILE()).get("s1")).toMatchObject({ enabled: false, disabledByUser: true });
+  });
+
+  test("a command that was running when the agent turned the mode off does not turn it back on with its result", async () => {
+    const clock = newClock();
+    const x = new FakeExec();
+    await startHub({ timers: clock, execClient: x });
+    const c = await enabled("s1", "T");
+    fake.pushUpdate(topicMsg({ chatId: GROUP, threadId: 100, fromId: ME, text: "/cmd echo hi" }));
+    await waitFor(() => x.starts.length === 1, WAIT_MS, "the command started");
+    await req(c, { op: "disable" });
+    const inbound = c.next("inbound", m => m.meta.source === "exec", WAIT_MS);
+    x.finish(x.last(), { kind: "exit", code: 0 });
+    await clock.advance(EXEC_CHECK_MS);
+    await inbound;
+    expect(new SessionStore(STORE_FILE()).get("s1")).toMatchObject({ enabled: false, disabledByUser: true });
   });
 
   test("tg_enable clears the explicit off", async () => {
@@ -1703,14 +1754,6 @@ describe("polling", () => {
     const FAKE_BOT_ID = 1;
     const OTHER_BOT_ID = 2;
     const STALE_OFFSET = 500;
-    const savedSchema = z.object({ botId: z.number(), offset: z.number() });
-    const savedOffset = (file: string) => {
-      try {
-        return savedSchema.parse(JSON.parse(readFileSync(file, "utf8")));
-      } catch {
-        return undefined;
-      }
-    };
     // The offset of the first getUpdates a hub sends after `before` calls.
     const firstOffsetAfter = async (before: number) => {
       await waitFor(() => fake.callsOf("getUpdates").length > before, WAIT_MS, "poll after the restart");
@@ -3921,6 +3964,8 @@ describe("questions", () => {
     return msg;
   };
   const edits = () => fake.callsOf("editMessageText");
+  // The hub has taken the update pushed last: it is either handled already or waits in flight (for a question's send).
+  const replyArrived = () => waitFor(() => fake.unconfirmedUpdates === 0 || hub.busy().includes("updates in flight"), WAIT_MS, "the reply reached the hub");
 
   test("a single choice is answered by its button, and the message shows the answer instead of the buttons", async () => {
     await startHub();
@@ -4083,13 +4128,62 @@ describe("questions", () => {
   test("a message sent while the question is not shown yet reaches the agent", async () => {
     await startHub();
     const a = await enabled("a");
-    fake.delayNext("sendMessage", SLOW_SEND_MS);
+    // The send is held before the question gets its id, so the message that comes meanwhile has a lower id.
+    const release = fake.holdNext("sendMessage");
     const answer = ask([Q1]);
     const msg = await polled();
     say("not yet");
-    expect(await a.nextNew("inbound")).toMatchObject({ content: "not yet" });
+    await replyArrived();
+    release();
+    expect(await a.next("inbound", m => m.content === "not yet")).toMatchObject({ content: "not yet" });
     press(dataOf(msg, 0), fake.lastMessageId);
     expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+  });
+
+  test("a reply that came in while the question was being sent answers it, whatever the order of the response and the update", async () => {
+    await startHub();
+    const a = await enabled("a");
+    // The question is posted and given its id, but the response to the hub is late: the reply already arrived by getUpdates.
+    const release = fake.holdNextResponse("sendMessage");
+    const answer = ask([Q1]);
+    await waitFor(() => fake.callsOf("sendMessage").length === 1);
+    say("my own words");
+    await replyArrived();
+    release();
+    expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "my own words" } });
+    await settle();
+    expect(a.messages.filter(m => m.type === "inbound")).toEqual([]);
+  });
+
+  test("a message older than a question that is being sent reaches the agent once the send is over", async () => {
+    await startHub();
+    const a = await enabled("a");
+    const release = fake.holdNext("sendMessage");
+    const answer = ask([Q1]);
+    const msg = await polled();
+    say("earlier");
+    await replyArrived();
+    release();
+    expect(await a.next("inbound", m => m.content === "earlier")).toMatchObject({ content: "earlier" });
+    expect(hub["polls"].size).toBe(1);
+    press(dataOf(msg, 1), fake.lastMessageId);
+    expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "Blue" } });
+  });
+
+  test("a message that came while the question's send failed is an ordinary message", async () => {
+    await startHub();
+    const a = await enabled("a");
+    const release = fake.holdNext("sendMessage");
+    // Telegram refuses the text twice: the second try is the one without entities.
+    fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
+    fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
+    const answer = ask([Q1]);
+    await polled();
+    say("hello");
+    await replyArrived();
+    release();
+    expect(await a.next("inbound", m => m.content === "hello")).toMatchObject({ content: "hello" });
+    expect(field(await answer, "decision")).toBe("deny");
   });
 
   test("messages sent together answer once, joined by blank lines", async () => {
@@ -4205,9 +4299,9 @@ describe("questions", () => {
   // manual clock keeps the group and the next batch open until the test closes them.
   describe("a text answer waiting when the poll ends other than by the answer", () => {
     const inboundTexts = (c: { messages: { type: string }[] }) => c.messages.filter(m => m.type === "inbound").map(m => field(m, "content"));
-    async function openPoll(questions: object[], signal?: AbortSignal) {
+    async function openPoll(questions: object[], signal?: AbortSignal, start: StartOptions = {}) {
       const clock = newClock();
-      await startHub({ catchUpMs: SHORT_CATCH_UP_MS, timers: clock });
+      await startHub({ catchUpMs: SHORT_CATCH_UP_MS, timers: clock, ...start });
       const a = await enabled("a");
       const answer = ask(questions, signal);
       await a.next("catchUp");
@@ -4235,10 +4329,11 @@ describe("questions", () => {
     });
 
     // A photo of the same answer, its download held until the returned function is called.
+    let photoUpdateId = 0;
     async function photoDownloading(): Promise<() => void> {
       fake.files.set("P2", { path: "photos/p.jpg", body: new Uint8Array([9]) });
       const release = fake.holdNext("getFile");
-      say(undefined, { caption: "look", photo: [{ file_id: "P2", file_unique_id: "u2" }] });
+      photoUpdateId = say(undefined, { caption: "look", photo: [{ file_id: "P2", file_unique_id: "u2" }] }).update_id;
       await waitFor(() => fake.callsOf("getFile").length === 1, WAIT_MS, "the photo is being downloaded");
       return release;
     }
@@ -4291,11 +4386,78 @@ describe("questions", () => {
       const { clock, a, msg } = await openPoll([Q1, Q2]);
       say("my own words");
       await groupWaits();
-      // The next question is still being sent, so a message sent now is no answer to it.
-      fake.delayNext("sendMessage", SLOW_SEND_MS);
+      // The next question is still being sent (its send is held), so a message sent now is no answer to it: the
+      // hub keeps it until the send is over, and it is an ordinary message after that.
+      const release = fake.holdNext("sendMessage");
       press(dataOf(msg, 0), fake.lastMessageId);
       await waitFor(() => !hub.busy().includes("answer groups"), WAIT_MS, "the group was taken");
-      expect(await sentAfter(clock, a)).toEqual(["my own words\n\nand then"]);
+      await waitFor(() => fake.callsOf("sendMessage").length === 2, WAIT_MS, "the next question is being sent");
+      say("and then");
+      await waitFor(() => hub.busy().includes("updates in flight"), WAIT_MS, "the message waits for the send");
+      release();
+      await updatesHandled();
+      await clock.advance(BATCH_QUIET_MS);
+      await settle();
+      expect(inboundTexts(a)).toEqual(["my own words\n\nand then"]);
+    });
+
+    // Words typed for a question that is not the last would, if taken as its answer at a stop, only move the poll on
+    // to the next question, which the stopping hub then refuses: the owner's words would be lost.
+    test("a stopping hub sends the words waiting for an earlier question to the agent", async () => {
+      const { a, answer } = await openPoll([Q1, Q3]);
+      say("my own words");
+      await groupWaits();
+      await hub.stop();
+      expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+      await waitFor(() => inboundTexts(a).length > 0, WAIT_MS, "the words reach the agent");
+      expect(inboundTexts(a)).toEqual(["my own words"]);
+    });
+
+    test("a stopping hub lets the words waiting for the last question answer it", async () => {
+      const { a, answer } = await openPoll([Q1]);
+      say("my own words");
+      await groupWaits();
+      await hub.stop();
+      expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "my own words" } });
+      expect(inboundTexts(a)).toEqual([]);
+    });
+
+    test("a stopping hub sends the waiting words to the agent also when another poll of the session is queued", async () => {
+      const { a, answer } = await openPoll([Q1, Q3]);
+      const second = ask([Q2]);
+      await queued(2);
+      say("my own words");
+      await groupWaits();
+      await hub.stop();
+      expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+      expect(await second).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+      await waitFor(() => inboundTexts(a).length > 0, WAIT_MS, "the words reach the agent");
+      expect(inboundTexts(a)).toEqual(["my own words"]);
+    });
+
+    // An answer still being taken in (its photo downloading) when the hub stops reaches delivery after the last
+    // flush. It must not start a batch that nothing flushes, nor count as handled: the next hub gets it again.
+    test("a message that would reach delivery after the hub's last flush is left for the next hub", async () => {
+      const file = join(dir, "poll-offset.json");
+      const rigDir = join(dir, "rig");
+      mkdirSync(rigDir, { recursive: true });
+      const { a, answer } = await openPoll([Q1, Q3], undefined, { pollOffsetFile: file, rigDir });
+      const release = await photoDownloading();
+      const photoUpdate = photoUpdateId;
+      await hub.stop();
+      expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+      release();
+      await waitFor(() => !hub.busy().includes("updates in flight"), WAIT_MS, "the update is over");
+      // One more turn of the event loop: what the poller does right after the update, saving its offset, has run.
+      await new Promise(resolve => setImmediate(resolve));
+      expect(hub.busy()).toEqual([]);
+      expect(savedOffset(file)?.offset ?? 0).toBeLessThanOrEqual(photoUpdate);
+      // Telegram brings it again, so the copy on disk would be a second one.
+      expect(hub["terminalInbox"]?.entries()).toEqual([]);
+      a.close();
+      await startHub({ pollOffsetFile: file });
+      const second = await plugin("a");
+      expect((await second.next("inbound")).content).toContain("look");
     });
   });
 
@@ -4618,6 +4780,20 @@ ${en.pollHookEnded}`));
     expect(sentTexts()).toEqual([Q1_TEXT]);
   });
 
+  test("a question that comes while the hub is stopping is refused at once", async () => {
+    await startHub();
+    await enabled("a");
+    const release = fake.holdNext("sendMessage");
+    const first = ask([Q1]);
+    await polled();
+    const stopping = hub.stop();
+    expect(await ask([Q2])).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+    release();
+    await stopping;
+    expect(await first).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+    expect(sentTexts()).toEqual([Q1_TEXT]);
+  });
+
   test("polls of two sessions are served at the same time, each by its own queue", async () => {
     await startHub();
     await enabled("a");
@@ -4756,6 +4932,20 @@ ${en.pollHookEnded}`));
     expect(ids.has(`open-${CALL_IDS}`)).toBe(true);
     ctl.abort();
     await Promise.all(open);
+  });
+
+  test("the call ids of a session fall back to the bound once the polls that held them over it end, while the window stays", async () => {
+    await startHub();
+    await terminalWindow();
+    const ctl = new AbortController();
+    const open = Array.from({ length: CALL_IDS + OVERFLOW }, (_, i) => hub["askQuestion"]("a", [Q1], ctl.signal, `open-${i}`));
+    expect(hub["taken"].get("a")?.size).toBe(CALL_IDS + OVERFLOW);
+    ctl.abort();
+    await Promise.all(open);
+    expect(hub["taken"].get("a")?.size).toBe(CALL_IDS);
+    // The newest stay, the oldest go.
+    expect(hub["taken"].get("a")?.has(`open-${CALL_IDS + OVERFLOW - 1}`)).toBe(true);
+    expect(hub["taken"].get("a")?.has("open-0")).toBe(false);
   });
 
   test("a session without a window keeps no dialog state once its polls are over", async () => {
