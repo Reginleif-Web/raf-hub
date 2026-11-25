@@ -3980,6 +3980,7 @@ describe("questions", () => {
     await answer;
     // The client resolves on its own abort; the hub learns of the closed request later, over the socket.
     await waitFor(() => hub["polls"].size === 0);
+    expect(hub["catchUps"].size).toBe(0);
     a.send({ type: "caughtUp", id: m.id });
     await settle();
     expect(fake.callsOf("sendMessage")).toEqual([]);
@@ -4212,6 +4213,49 @@ describe("questions", () => {
       press(dataOf(msg, 2, 1), fake.lastMessageId);
       expect(await answer).toEqual({ decision: "deny", reason: CANCEL_REASON });
       expect(await sentAfter(clock, a)).toEqual(["my own words\n\nand then"]);
+    });
+
+    // A photo of the same answer, its download held until the returned function is called.
+    async function photoDownloading(): Promise<() => void> {
+      fake.files.set("P2", { path: "photos/p.jpg", body: new Uint8Array([9]) });
+      const release = fake.holdNext("getFile");
+      say(undefined, { caption: "look", photo: [{ file_id: "P2", file_unique_id: "u2" }] });
+      await waitFor(() => fake.callsOf("getFile").length === 1, WAIT_MS, "the photo is being downloaded");
+      return release;
+    }
+
+    test("words and a photo sent with them answer one question, however long the photo downloads", async () => {
+      const { clock, a, answer } = await openPoll([Q1, Q3]);
+      say("my own words");
+      await groupWaits();
+      const release = await photoDownloading();
+      await clock.advance(BATCH_QUIET_MS);
+      expect(hub["answerGroups"].size).toBe(1);
+      release();
+      await updatesHandled();
+      await clock.advance(BATCH_QUIET_MS);
+      const next = await shown(2);
+      press(dataOf(next, 1), fake.lastMessageId);
+      const answers = field(await answer, "answers");
+      expect(String(field(answers, "Which color?")).startsWith(`my own words\n\nlook (photo: ${join(dir, "inbox")}`)).toBe(true);
+      expect(field(answers, "Which size?")).toBe("Large");
+      expect(inboundTexts(a)).toEqual([]);
+    });
+
+    test("a poll that ends while a photo of the answer downloads sends both to the agent in order", async () => {
+      const ctl = new AbortController();
+      const { clock, a, answer } = await openPoll([Q1], ctl.signal);
+      say("my own words");
+      await groupWaits();
+      const release = await photoDownloading();
+      ctl.abort();
+      await answer;
+      await waitFor(() => hub["polls"].size === 0);
+      release();
+      await updatesHandled();
+      const texts = (await sentAfter(clock, a)).map(String);
+      expect(texts).toHaveLength(1);
+      expect(texts[0]).toMatch(/^my own words\n\nlook[^]*\n\nand then$/);
     });
 
     test("a hook that stops waiting sends them before a later message", async () => {
@@ -4681,6 +4725,35 @@ ${en.pollHookEnded}`));
     expect(ids.has("call-0")).toBe(false);
     press(dataOf(msg, 0), fake.lastMessageId);
     expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "Red" } });
+  });
+
+  test("the call of an open poll is remembered even when more polls than the bound are open", async () => {
+    await startHub();
+    await terminalWindow();
+    const ctl = new AbortController();
+    const open = Array.from({ length: CALL_IDS + 1 }, (_, i) => hub["askQuestion"]("a", [Q1], ctl.signal, `open-${i}`));
+    const ids = hub["taken"].get("a") ?? new Set<string>();
+    expect(ids.has("open-0")).toBe(true);
+    expect(ids.has(`open-${CALL_IDS}`)).toBe(true);
+    ctl.abort();
+    await Promise.all(open);
+  });
+
+  test("a session without a window keeps no dialog state once its polls are over", async () => {
+    await startHub();
+    const a = await terminalWindow();
+    a.close();
+    await waitFor(() => !hub.isConnected("a"));
+    const ctl = new AbortController();
+    const open = [hub["askQuestion"]("a", [Q1], ctl.signal, "t1"), hub["askQuestion"]("a", [Q1], ctl.signal)];
+    expect(dialogState("a")).toEqual([true, true, false]);
+    ctl.abort();
+    await Promise.all(open);
+    expect(dialogState("a")).toEqual([false, false, false]);
+    // A call refused with no poll made, as while the session starts.
+    hub["takeCall"]("a", "t2");
+    hub["takeCall"]("a", undefined);
+    expect(dialogState("a")).toEqual([false, false, false]);
   });
 
   test("the warned dialogs of a session are bounded to the newest", async () => {

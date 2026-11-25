@@ -741,6 +741,12 @@ export class Hub {
   private releaseSession(sid: string): void {
     if (this.connOf(sid)) return;
     this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+    this.forgetDialogs(sid);
+  }
+
+  // What the hub keeps of a session's dialogs lives while the session has a window or an open poll.
+  private forgetDialogs(sid: string): void {
+    if (this.connOf(sid) || this.pollsOf(sid).length > 0) return;
     this.taken.delete(sid);
     this.anonymousAsk.delete(sid);
     this.warnedDialogs.delete(sid);
@@ -1141,10 +1147,10 @@ ${msg.text}`);
   // earlier one ends, and an older poll is never ended by a newer one.
   private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal, toolUseId?: string): Promise<QuestionDecision> {
     const key = randomUUID().replaceAll("-", "").slice(0, PERMISSION_KEY_CHARS);
-    this.takeCall(sessionId, toolUseId);
     return new Promise(resolve => {
       const p: Poll = { key, sessionId, toolUseId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], done: false, resolve };
       this.polls.set(key, p);
+      this.takeCall(sessionId, toolUseId);
       if (signal.aborted) {
         this.spawn(this.finishPoll(p, { decision: "none" }, this.m().pollHookEnded));
         return;
@@ -1165,11 +1171,9 @@ ${msg.text}`);
 
   // Notes that the hub handled a tool call of the session; a call without an id cannot be told apart later.
   private takeCall(sessionId: string, toolUseId: string | undefined): void {
-    if (toolUseId === undefined) {
-      this.anonymousAsk.add(sessionId);
-      return;
-    }
-    this.rememberCall(this.taken, sessionId, toolUseId);
+    if (toolUseId === undefined) this.anonymousAsk.add(sessionId);
+    else this.rememberCall(this.taken, sessionId, toolUseId);
+    this.forgetDialogs(sessionId);
   }
 
   // Adds a call id to the session's set in `calls`, newest last. Past MAX_CALL_IDS the oldest ids go, but never
@@ -1266,6 +1270,8 @@ ${msg.text}`);
     if (p.done) return;
     p.done = true;
     this.polls.delete(p.key);
+    this.forgetDialogs(p.sessionId);
+    this.catchUps.get(p.key)?.();
     const flushed = this.takeAnswer(p.key);
     if (advance) this.startNext(p.sessionId);
     p.outcomes[p.index] = outcome;
@@ -1990,6 +1996,8 @@ ${msg.text}`);
   // agent. A "!" message cancels the poll and goes on to the agent as an
   // ordinary message, since the agent waits for the answer and has no turn to
   // stop. Returns the message to deliver, or undefined when nothing is left of it.
+  // A message belongs to the question shown when it came: while its photos download, the answer group it may
+  // join waits, and if the question is over by then, the message goes to the agent.
   private async toPoll(api: TelegramApi, sessionId: string, m: Message): Promise<Message | undefined> {
     // The first poll of the session is the one shown; the others wait unseen and take no message.
     const p = this.pollsOf(sessionId)[0];
@@ -2004,27 +2012,45 @@ ${msg.text}`);
     }
     const shownAs = p.messageIds[p.index];
     if (shownAs === undefined || m.message_id <= shownAs || p.done) return m;
-    const text = m.text ?? m.caption ?? (m.rich_message ? await this.richContent(api, m.rich_message) : undefined);
-    const part = [text, await this.fileMark(api, m)].filter(s => s !== undefined && s !== "").join(" ");
-    if (!part) return m;
-    if (p.done) return m;
+    const index = p.index;
+    const resume = this.holdAnswer(p.key);
+    let part: string;
+    try {
+      const text = m.text ?? m.caption ?? (m.rich_message ? await this.richContent(api, m.rich_message) : undefined);
+      part = [text, await this.fileMark(api, m)].filter(s => s !== undefined && s !== "").join(" ");
+    } finally {
+      resume();
+    }
+    if (!part || p.done || p.index !== index) return m;
     this.addAnswer(api, p, m, part);
     return undefined;
   }
 
+  // Stops the quiet window of a waiting answer; the returned function starts it anew if the answer still waits.
+  private holdAnswer(key: string): () => void {
+    const g = this.answerGroups.get(key);
+    if (g) this.clearTimer(g.timer);
+    return () => {
+      if (g && this.answerGroups.get(key) === g) g.timer = this.answerTimer(key);
+    };
+  }
+
+  private answerTimer(key: string): ReturnType<typeof setTimeout> {
+    return this.setTimer(() => this.spawn(this.takeAnswer(key)), this.opts.batchQuietMs ?? BATCH_QUIET_MS);
+  }
+
   // An answer message waits for the ones sent with it, like a batch.
   private addAnswer(api: TelegramApi, p: Poll, m: Message, part: string): void {
-    const quietMs = this.opts.batchQuietMs ?? BATCH_QUIET_MS;
     const g = this.answerGroups.get(p.key);
     if (g && g.index === p.index) {
       g.messages.push(m);
       g.parts.push(part);
       this.clearTimer(g.timer);
-      g.timer = this.setTimer(() => this.spawn(this.takeAnswer(p.key)), quietMs);
+      g.timer = this.answerTimer(p.key);
       return;
     }
     if (g) this.spawn(this.takeAnswer(p.key));
-    const timer = this.setTimer(() => this.spawn(this.takeAnswer(p.key)), quietMs);
+    const timer = this.answerTimer(p.key);
     this.answerGroups.set(p.key, { api, poll: p, index: p.index, messages: [m], parts: [part], timer });
   }
 

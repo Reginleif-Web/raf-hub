@@ -77,7 +77,9 @@ file marks as in incoming batches ("(photo: path)", "(kind: name, file_id: X)").
 counts as an answer (its `message_id` is greater);
 a message older than the question or sent while the question is not yet shown goes to the agent as an ordinary
 incoming message. Several messages sent together (an album, a couple of lines in a row) are one answer: the hub
-collects them with the same quiet window as incoming batches. The answer message gets the same ✍
+collects them with the same quiet window as incoming batches, which waits while a photo of the answer downloads. A
+message belongs to the question shown when it came; if that question is over once its photo is downloaded, the message
+goes to the agent. The answer message gets the same ✍
 "not yet read" reaction as an ordinary incoming message; when the agent gets the answers, the hub removes it. If the poll
 ended without answers to the agent (cancel, move to the terminal), the ✍ stays: the agent did not read that message.
 Commands (`/info`, `/compact`, `/pwsh` and so on) do not count as an answer, work as usual and do not
@@ -270,7 +272,7 @@ that the oldest ids go, but never the id of a poll that is still open. The state
 `anonymousAsk`, `warnedDialogs`) is released by one function in two cases: the last window of the session closes, and a
 window moves to another session while no other window holds the first (all polls of the first end with the
 `windowGone` refusal, as for a close). A resume of the same session id ends nothing, and neither does a window whose
-session another window still holds.
+session another window still holds. A session without a window keeps dialog state only while it has an open poll.
 
 Gaps, none of them a false notice: a dialog not yet flushed to the transcript at that moment is missed until the next
 message; the owner may answer on the PC between the check and the notice; a notice is not repeated for a call, even if
