@@ -350,7 +350,7 @@ test("each specified work category blocks update exit, while a pending shell doe
     { name: "ready timer", add: () => { hub["readyTimers"].add(timer); }, remove: () => hub["readyTimers"].clear() },
     { name: "batch of messages", add: () => { hub["batches"].set("session", { api: f.api, messages: [], quietTimer: timer, maxTimer: timer }); }, remove: () => hub["batches"].clear() },
     { name: "batch being sent", add: () => { hub["batchSends"].set("session", pending); }, remove: () => hub["batchSends"].clear() },
-    { name: "answer group", add: () => { hub["answerGroups"].set("q", { api: f.api, poll: pollOf(), index: 0, messages: [], parts: [], timer }); }, remove: () => hub["answerGroups"].clear() },
+    { name: "answer group", add: () => { hub["answerGroups"].set("q", { api: f.api, poll: pollOf(), index: 0, messages: [], parts: [], deadline: 0, timer }); }, remove: () => hub["answerGroups"].clear() },
     { name: "pumping a session outbox", add: () => { hub["pumping"].add("session"); }, remove: () => hub["pumping"].clear() },
     { name: "card being edited", add: () => { hub["cards"].set("session:card", { text: "card", entities: [], final: false, done: false, lastEdit: 0, editing: true }); }, remove: () => hub["cards"].clear() },
     { name: "General flush in flight", add: () => { hub["machineOutbox"]["flushing"] = pending; }, remove: () => { hub["machineOutbox"]["flushing"] = undefined; } },

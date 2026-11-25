@@ -192,7 +192,7 @@ type Launch = { held: Held[]; old: Set<WS>; mode?: PermissionMode; account?: str
 // How a stop or a cleanup came out for the hold it set.
 type EndingResult = "ended" | "failed" | "not-running";
 // Topic messages of a session waiting to go to its window together.
-type AnswerGroup = { api: TelegramApi; poll: Poll; index: number; messages: Message[]; parts: string[]; timer: ReturnType<typeof setTimeout> };
+type AnswerGroup = { api: TelegramApi; poll: Poll; index: number; messages: Message[]; parts: string[]; deadline: number; timer: ReturnType<typeof setTimeout> };
 type Batch = { api: TelegramApi; messages: Message[]; quietTimer: ReturnType<typeof setTimeout>; maxTimer: ReturnType<typeof setTimeout> };
 export type HubOptions = {
   port: number;
@@ -2026,17 +2026,23 @@ ${msg.text}`);
     return undefined;
   }
 
-  // Stops the quiet window of a waiting answer; the returned function starts it anew if the answer still waits.
+  // Stops the wait of an answer; the returned function starts it anew if the answer still waits. The time
+  // held does not count towards the answer's age.
   private holdAnswer(key: string): () => void {
     const g = this.answerGroups.get(key);
     if (g) this.clearTimer(g.timer);
+    const heldAt = this.timers.now();
     return () => {
-      if (g && this.answerGroups.get(key) === g) g.timer = this.answerTimer(key);
+      if (!g || this.answerGroups.get(key) !== g) return;
+      g.deadline += this.timers.now() - heldAt;
+      g.timer = this.answerTimer(key, g.deadline);
     };
   }
 
-  private answerTimer(key: string): ReturnType<typeof setTimeout> {
-    return this.setTimer(() => this.spawn(this.takeAnswer(key)), this.opts.batchQuietMs ?? BATCH_QUIET_MS);
+  // Like a batch, an answer goes once no message came for the quiet window, or once it is old enough.
+  private answerTimer(key: string, deadline: number): ReturnType<typeof setTimeout> {
+    const wait = Math.min(this.opts.batchQuietMs ?? BATCH_QUIET_MS, Math.max(0, deadline - this.timers.now()));
+    return this.setTimer(() => this.spawn(this.takeAnswer(key)), wait);
   }
 
   // An answer message waits for the ones sent with it, like a batch.
@@ -2046,12 +2052,12 @@ ${msg.text}`);
       g.messages.push(m);
       g.parts.push(part);
       this.clearTimer(g.timer);
-      g.timer = this.answerTimer(p.key);
+      g.timer = this.answerTimer(p.key, g.deadline);
       return;
     }
     if (g) this.spawn(this.takeAnswer(p.key));
-    const timer = this.answerTimer(p.key);
-    this.answerGroups.set(p.key, { api, poll: p, index: p.index, messages: [m], parts: [part], timer });
+    const deadline = this.timers.now() + (this.opts.batchMaxMs ?? BATCH_MAX_MS);
+    this.answerGroups.set(p.key, { api, poll: p, index: p.index, messages: [m], parts: [part], deadline, timer: this.answerTimer(p.key, deadline) });
   }
 
   // The waiting messages answer their question, their parts after blank

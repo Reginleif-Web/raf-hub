@@ -4104,6 +4104,25 @@ describe("questions", () => {
     expect(a.messages.filter(m => m.type === "inbound")).toEqual([]);
   });
 
+  test("a steady stream of messages answers once the first of them is old enough", async () => {
+    // The quiet window outlasts the whole stream, so only the cap can end the wait.
+    const clock = newClock();
+    await startHub({ catchUpMs: SHORT_CATCH_UP_MS, batchQuietMs: STREAM_QUIET_MS, batchMaxMs: STREAM_MAX_MS, timers: clock });
+    const a = await enabled("a");
+    const answer = ask([Q1]);
+    await a.next("catchUp");
+    await clock.advance(SHORT_CATCH_UP_MS);
+    await shown();
+    for (const text of ["m0", "m1", "m2"]) {
+      say(text);
+      await updatesHandled();
+      expect(hub["polls"].size).toBe(1);
+      await clock.advance(STREAM_STEP_MS);
+    }
+    await waitFor(() => hub["polls"].size === 0);
+    expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "m0\n\nm1\n\nm2" } });
+  });
+
   test("an album answers once, with a file mark for each file", async () => {
     await startHub();
     await enabled("a");

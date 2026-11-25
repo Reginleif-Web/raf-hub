@@ -77,7 +77,8 @@ file marks as in incoming batches ("(photo: path)", "(kind: name, file_id: X)").
 counts as an answer (its `message_id` is greater);
 a message older than the question or sent while the question is not yet shown goes to the agent as an ordinary
 incoming message. Several messages sent together (an album, a couple of lines in a row) are one answer: the hub
-collects them with the same quiet window as incoming batches, which waits while a photo of the answer downloads. A
+collects them with the same quiet window and the same longest wait as incoming batches; both stand still while a photo
+of the answer downloads. A
 message belongs to the question shown when it came; if that question is over once its photo is downloaded, the message
 goes to the agent. The answer message gets the same ✍
 "not yet read" reaction as an ordinary incoming message; when the agent gets the answers, the hub removes it. If the poll
