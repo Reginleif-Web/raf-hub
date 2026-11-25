@@ -5109,6 +5109,25 @@ ${en.pollHookEnded}`));
         expect(inbound(second)).toEqual(["and then"]);
       });
 
+      test("words are marked seen only after the answer has left the hub, not in the step that writes it", async () => {
+        const { clock, a, file } = await startWithInbox();
+        const stream = askStreaming([Q1]);
+        await showFirst(clock, a);
+        await typeWords(file, "mine");
+        await waitFor(() => hub.busy().includes("answer groups"), WAIT_MS, "the answer waits in its group");
+        const [poll] = hub["polls"].values();
+        const write = must(poll.stream);
+        let kept: number | undefined;
+        poll.stream = frame => {
+          queueMicrotask(() => { kept = inboxIds().length; });
+          return write(frame);
+        };
+        await clock.advance(BATCH_QUIET_MS);
+        await (await stream).finished;
+        expect(kept).toBe(1);
+        await waitFor(() => inboxIds().length === 0, WAIT_MS, "the words are marked seen");
+      });
+
       test("words that answered the last question of a poll the hook was not sent line by line are marked seen once the poll is decided", async () => {
         const { clock, a, file, rigDir } = await startWithInbox();
         const answer = ask([Q1]);

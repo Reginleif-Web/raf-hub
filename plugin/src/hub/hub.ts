@@ -1366,12 +1366,14 @@ ${msg.text}`);
 
   // The words of the answers a poll took stay in the terminal inbox (a killed hub does not lose them) until
   // they reached the agent: they are marked seen once the answer is with the hook (see answerPoll) or the poll
-  // ends. A kill between the frame and this mark leaves them in the inbox, so the next hub may deliver them
-  // once more: an answer can come twice in that instant, never get lost.
+  // ends. What is written to the hook leaves the hub only after the step that writes it, so the mark comes a turn
+  // of the event loop later. A kill between the two leaves the words in the inbox, so the next hub may deliver
+  // them once more: an answer can come twice in that instant, never get lost.
   private markHeldSeen(p: Poll): void {
-    if (!p.heldIds?.length) return;
-    this.terminalInbox?.seen(p.heldIds);
+    const ids = p.heldIds;
+    if (!ids?.length) return;
     p.heldIds = [];
+    this.spawn(new Promise<void>(resolve => setImmediate(resolve)).then(() => this.terminalInbox?.seen(ids)));
   }
 
   private async answerPoll(p: Poll, answer: string): Promise<void> {

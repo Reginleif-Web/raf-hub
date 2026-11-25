@@ -88,7 +88,11 @@ async function decide(): Promise<Output | undefined> {
   const answersSoFar = () => Object.fromEntries(answered);
   const allow = (answers: Record<string, string>): Output => ({ permissionDecision: "allow", permissionDecisionReason: "Answered in Telegram", updatedInput: { ...input.tool_input, answers } });
   // Every question of the call has an answer: only the decision itself was missing.
-  const allAnswered = () => input.tool_input.questions.length > 0 && input.tool_input.questions.every(q => typeof (q as { question?: unknown })?.question === "string" && answered.has((q as { question: string }).question));
+  // Answers go by question text, so one answer never stands for two questions with the same text.
+  const allAnswered = () => {
+    const texts = input.tool_input.questions.map(q => (q as { question?: unknown } | undefined)?.question);
+    return texts.length > 0 && new Set(texts).size === texts.length && texts.every(t => typeof t === "string" && answered.has(t));
+  };
   // The one rule for a technical end; the persisted mode tells whether the owner counts on Telegram. The reason
   // is built here, from the answers received, so the hub never has to repeat them (and never does for a hook that
   // ended the wait itself).
@@ -153,9 +157,9 @@ async function decide(): Promise<Output | undefined> {
   try {
     decision = questionDecision.safeParse(JSON.parse(decisionLine));
   } catch {
-    return technicalEnd("notTaken");
+    return endWithoutDecision("notTaken");
   }
-  if (!decision.success) return technicalEnd("notTaken");
+  if (!decision.success) return endWithoutDecision("notTaken");
   const d = decision.data;
   // The terminal dialog opens only when the persisted mode is not on right now: a new hub answers none only
   // with the mode off, but an older one also does for technical ends, and then the owner reads Telegram.

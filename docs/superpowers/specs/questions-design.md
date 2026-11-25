@@ -271,7 +271,8 @@ answer are JSON strings: a newline or a quote in a typed answer cannot be taken 
 output stays valid JSON. Answers are never cut, however long.
 
 When every question of the call was answered before the end and only the decision is missing, the hook's end is the
-allow with those answers instead of a deny. A frame for a question the call did not ask does not count toward that.
+allow with those answers instead of a deny, unless two questions have the same text. A frame for a question the call
+did not ask does not count toward that.
 The owner's cancel, the mode turned off and a session restart carry nothing.
 
 **A text answer waiting when the poll ends.** An owner's text that the hub took as the answer to a question (it waits in
@@ -288,8 +289,9 @@ earlier one.
 hub killed meanwhile would lose the words that only lived in memory. So the words go into the terminal inbox
 (`terminalInbox`, the same file that holds any topic message not yet seen by the agent) from the moment they join
 the group, and are marked seen only once the agent has them:
-- when they became an accepted answer that was written to the hook as a frame (the frame is written first, then the
-  words are marked seen; a kill between the two writes errs toward a duplicate, never a loss);
+- when they became an accepted answer that was written to the hook as a frame (the frame is written first, and the
+  words are marked seen a turn of the event loop later, when it has left the hub; a kill in between errs toward a
+  duplicate, never a loss);
 - when the poll is decided (`finishPoll` marks what is left of its answers, for a hook that gets no frames), or when
   they are delivered as an ordinary message and the agent reports it saw them.
 

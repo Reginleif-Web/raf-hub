@@ -191,8 +191,8 @@ describe("AskUserQuestion hook", () => {
 
   // The hook reads the persisted mode of the session from its state dir when the hub is unreachable, so every
   // run gets an empty state dir of its own (never the real one) unless the test gives one.
-  async function runQuestion(port: number, input: object, extraEnv: Record<string, string> = {}) {
-    const proc = Bun.spawn([process.execPath, QUESTION_HOOK], {
+  async function runQuestion(port: number, input: object, extraEnv: Record<string, string> = {}, preload?: string) {
+    const proc = Bun.spawn([process.execPath, ...(preload ? ["--preload", preload] : []), QUESTION_HOOK], {
       stdin: new Blob([JSON.stringify(input)]),
       stdout: "pipe",
       env: { ...process.env, TELEGRAM_HUB_STATE_DIR: tempDir(), TELEGRAM_HUB_PORT: String(port), CLAUDE_CODE_MESSAGING_SOCKET: "pipe-Q", ...extraEnv },
@@ -528,9 +528,9 @@ describe("AskUserQuestion hook", () => {
     };
 
     // A raw HTTP hub that took the poll: the headers, a first chunk " " and then the given pieces, each its own
-    // HTTP chunk. "cut" ends the socket without the closing chunk (a killed hub), "close" ends the body properly,
+    // HTTP chunk. "close" ends the body properly,
     // "hold" leaves it open. seen.request is the request head the hook sent.
-    async function rawHub(pieces: Uint8Array[], end: "cut" | "close" | "hold") {
+    async function rawHub(pieces: Uint8Array[], end: "close" | "hold") {
       const port = await freePort();
       const seen = { got: 0, request: "" };
       const parts: Uint8Array[] = [bytes(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-question-accepted: 1\r\ntransfer-encoding: chunked\r\n\r\n`)];
@@ -568,9 +568,16 @@ describe("AskUserQuestion hook", () => {
       return { port, seen };
     }
 
+    // The hook against a hub that sends the pieces and is killed once the hook has read them all.
+    async function runCut(pieces: Uint8Array[], input: object) {
+      const { port, seen } = await rawHub(pieces, "hold");
+      const sent = pieces.reduce((n, p) => n + p.length, bytes(" ").length);
+      const r = await runQuestion(port, input, { TEST_CUT_AFTER: String(sent) }, join(import.meta.dir, "cut-after-read.ts"));
+      return { ...r, seen };
+    }
+
     test("a cut after one of two answers carries the answer and asks only for the rest", async () => {
-      const { port, seen } = await rawHub(splitInsideLetter(frame(Q1, A1)), "cut");
-      const r = await runQuestion(port, TWO);
+      const { seen, ...r } = await runCut(splitInsideLetter(frame(Q1, A1)), TWO);
       expect(r.status).toBe(0);
       expect(seen.request).toMatch(/x-question-stream: 1/i);
       const reason = denyOf(r.stdout);
@@ -615,14 +622,25 @@ describe("AskUserQuestion hook", () => {
     });
 
     test("every question answered before the cut is an allow with the answers", async () => {
-      const { port } = await rawHub([bytes(frame(Q1, A1)), bytes(frame(Q2, "L"))], "cut");
-      const r = await runQuestion(port, TWO);
+      const r = await runCut([bytes(frame(Q1, A1)), bytes(frame(Q2, "L"))], TWO);
       expect(JSON.parse(r.stdout).hookSpecificOutput).toMatchObject({ permissionDecision: "allow", updatedInput: { answers: { [Q1]: A1, [Q2]: "L" } } });
     });
 
+    test("every question answered before an unreadable end is an allow with the answers", async () => {
+      for (const end of ["not json\n", `${JSON.stringify({ decision: "maybe" })}\n`]) {
+        const { port } = await rawHub([bytes(frame(Q1, A1)), bytes(frame(Q2, "L")), bytes(end)], "close");
+        const r = await runQuestion(port, TWO);
+        expect(JSON.parse(r.stdout).hookSpecificOutput).toMatchObject({ permissionDecision: "allow", updatedInput: { answers: { [Q1]: A1, [Q2]: "L" } } });
+      }
+    });
+
+    test("one answer does not stand for two questions with the same text", async () => {
+      const same = { ...INPUT, tool_input: { questions: [QUESTIONS[0], QUESTIONS[0]] } };
+      expectCarries(denyOf((await runCut([bytes(frame(Q1, A1))], same)).stdout), Q1, A1);
+    });
+
     test("an answer to a question the call did not ask does not make an allow", async () => {
-      const { port } = await rawHub([bytes(frame("Other?", "x"))], "cut");
-      const reason = denyOf((await runQuestion(port, INPUT)).stdout);
+      const reason = denyOf((await runCut([bytes(frame("Other?", "x"))], INPUT)).stdout);
       expect(reason).toContain(listed("Other?", "x"));
     });
 
@@ -638,8 +656,7 @@ describe("AskUserQuestion hook", () => {
     });
 
     test("a cut with no frame keeps the texts exactly as they were", async () => {
-      const { port } = await rawHub([], "cut");
-      const reason = denyOf((await runQuestion(port, TWO)).stdout);
+      const reason = denyOf((await runCut([], TWO)).stdout);
       expectAskAgain(reason);
       expect(reason).not.toContain("Already answered");
     });
