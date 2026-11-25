@@ -2,10 +2,11 @@
 // question, and the callback data the buttons carry.
 import type { Messages } from "../shared/i18n/index.ts";
 import type { Entity, Formatted } from "../shared/markdown.ts";
-import type { AskQuestion, QuestionDecision } from "../shared/protocol.ts";
+import type { AskQuestion, QuestionDecision, QuestionFrame } from "../shared/protocol.ts";
 import type { Button } from "./telegram.ts";
 
 import { chunk, MAX_MESSAGE } from "../shared/chunk.ts";
+import { reasonWithAnswers } from "../shared/question-answers.ts";
 import { MAX_REPLY_CHARS } from "./reply-context.ts";
 
 // A preview longer than this is cut; a text longer than TEXT_LIMIT goes
@@ -47,9 +48,32 @@ const ASK_AGAIN_WHY: Record<AskAgainWhy, string> = {
 export const NOT_SHOWN_REASON =
   "Telegram did not accept the message with the question (it may be too long or malformed), so it was not shown, and nothing was asked in the terminal. Do not call AskUserQuestion again for this question. Write the question as plain text in your reply, shorter or simpler if it was long, and end your turn; the owner answers in a normal message.";
 
-export function askAgainReason(why: AskAgainWhy): string {
-  return `The question got no answer in Telegram because ${ASK_AGAIN_WHY[why]}. Nothing was answered and nothing was asked in the terminal. Ask it again with a single AskUserQuestion call, shorter or simpler if it was long.`;
+// With answers (the questions of the poll the owner had answered before it ended), the reason names them and
+// asks only for the rest; without, it is the text it always was.
+export function askAgainReason(why: AskAgainWhy, answers?: Record<string, string>): string {
+  return reasonWithAnswers(
+    {
+      without: `The question got no answer in Telegram because ${ASK_AGAIN_WHY[why]}. Nothing was answered and nothing was asked in the terminal. Ask it again with a single AskUserQuestion call, shorter or simpler if it was long.`,
+      withAnswers: `Not all questions got an answer in Telegram because ${ASK_AGAIN_WHY[why]}, and nothing was asked in the terminal.`,
+      askRest: "Do not ask the answered questions again: ask only the unanswered ones, with a single AskUserQuestion call, shorter or simpler if it was long.",
+    },
+    answers,
+  );
 }
+
+export function notShownReason(answers?: Record<string, string>): string {
+  return reasonWithAnswers(
+    {
+      without: NOT_SHOWN_REASON,
+      withAnswers: "Telegram did not accept the message with the next question (it may be too long or malformed), so it was not shown, and nothing was asked in the terminal.",
+      askRest: "Do not call AskUserQuestion again for the unanswered questions, and do not ask the answered ones again. Write only the unanswered questions as plain text in your reply, shorter or simpler if they were long, and end your turn; the owner answers in a normal message.",
+    },
+    answers,
+  );
+}
+
+// A deny for a technical end, built when the poll ends from the answers it got by then (see finishPoll).
+export type Refusal = (answers: Record<string, string>) => string;
 
 // An open poll. Questions go one at a time: index is the one shown now.
 // Each shown question has its message id once sent and its outcome line
@@ -74,6 +98,12 @@ export type Poll = {
   outcomes: (string | undefined)[];
   // Topic messages taken as answers: their ✍ comes off once the agent has them.
   taken: number[];
+  // Topic messages that joined an answer group and are kept in the terminal inbox (so a killed hub does not
+  // lose them): marked seen once their answer reached the hook, or when the poll ends.
+  heldIds?: number[] | undefined;
+  // Writes an accepted answer to the hook that asked for the stream, and says whether it went out; undefined for
+  // a hook that did not ask.
+  stream?: ((frame: QuestionFrame) => boolean) | undefined;
   done: boolean;
   resolve(d: QuestionDecision): void;
 };

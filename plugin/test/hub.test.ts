@@ -10,7 +10,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { basename, join } from "path";
 import { z } from "zod";
 import { Hub, MAX_CARDS, projectName } from "../src/hub/hub.ts";
-import { askAgainReason, CANCEL_REASON, NOT_SHOWN_REASON, SESSION_RESTARTING_REASON } from "../src/hub/questions.ts";
+import { askAgainReason, CANCEL_REASON, NOT_SHOWN_REASON, notShownReason, SESSION_RESTARTING_REASON } from "../src/hub/questions.ts";
 import { RIG_SESSION_LIMIT_MS } from "../src/hub/rig-session.ts";
 import { MAX_MESSAGE } from "../src/shared/chunk.ts";
 import { en } from "../src/shared/i18n/en.ts";
@@ -19,7 +19,7 @@ import { SessionStore } from "../src/hub/sessions.ts";
 import { saveRuns } from "../src/hub/exec-runs.ts";
 import { TelegramApi } from "../src/hub/telegram.ts";
 import { arr, field } from "../src/shared/guards.ts";
-import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER } from "../src/shared/protocol.ts";
+import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER, QUESTION_STREAM_HEADER } from "../src/shared/protocol.ts";
 import { toTelegram } from "../src/shared/markdown.ts";
 import { notifies } from "../src/shared/notification.ts";
 import { FakeExec } from "./fake-exec.ts";
@@ -4843,6 +4843,304 @@ ${en.pollHookEnded}`));
     a.close();
     expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("windowGone") });
     await waitFor(() => edits().some(e => e.text === `${Q1_TEXT}\n\n${en.pollAskedAgain}`));
+  });
+
+  // A poll of two questions ends for a technical reason after the first was answered: the agent gets the answer
+  // already given and asks only the rest. The owner's own end (Cancel, "!", the mode off) drops everything.
+  describe("a poll that ends for a technical reason after some of its questions were answered", () => {
+    const RED = { "Which color?": "Red" };
+    const ALREADY = "Already answered in Telegram";
+    const occurrences = (text: string, part: string) => text.split(part).length - 1;
+    // Q1 is shown and answered with its button; the poll goes on with Q3 (its message is the second one sent).
+    const answerRed = async (before?: () => void) => {
+      const msg = await shown();
+      before?.();
+      press(dataOf(msg, 0), fake.lastMessageId);
+      return await polled(2);
+    };
+    // What a hook that announces the stream (QUESTION_STREAM_HEADER) reads: the lines of the body, read while it is open.
+    const askStreaming = async (questions: object[]) => {
+      const res = await fetch(`http://127.0.0.1:${port}/question`, {
+        method: "POST",
+        headers: { [QUESTION_STREAM_HEADER]: "1" },
+        body: JSON.stringify({ messagingSocket: "win-a", session_id: "a", tool_input: { questions } }),
+      });
+      const decoder = new TextDecoder();
+      const state = { raw: "" };
+      const reader = must(res.body).getReader();
+      const finished = (async () => {
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          state.raw += decoder.decode(chunk.value, { stream: true });
+        }
+      })();
+      const lines = (): unknown[] =>
+        state.raw
+          .split("\n")
+          .map(l => l.trim())
+          .filter(Boolean)
+          .map(l => JSON.parse(l));
+      return { res, state, finished, lines };
+    };
+    const frame = (question: string, answer: string) => ({ answered: { question, answer } });
+
+    test("a hub that stops names the answer already given and asks only the rest", async () => {
+      await startHub();
+      await enabled("a");
+      const answer = ask([Q1, Q3]);
+      await answerRed();
+      await settle();
+      await hub.stop();
+      const result = await answer;
+      expect(result).toEqual({ decision: "deny", reason: askAgainReason("hubStopping", RED) });
+      expect(String(field(result, "reason"))).toContain('- "Which color?": "Red"');
+      expect(String(field(result, "reason"))).toContain("ask only the unanswered ones");
+      expect(String(field(result, "reason"))).not.toContain("Nothing was answered");
+    });
+
+    test("a window that goes away names the answer already given", async () => {
+      await startHub();
+      const a = await enabled("a");
+      const answer = ask([Q1, Q3]);
+      await answerRed();
+      await settle();
+      a.close();
+      expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("windowGone", RED) });
+    });
+
+    test("a question Telegram does not accept names the answer already given and says to write the rest as text", async () => {
+      await startHub();
+      await enabled("a");
+      const answer = ask([Q1, Q3]);
+      await answerRed(() => {
+        // Telegram refuses the text of the next question twice: with entities, then without.
+        fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
+        fake.failNext("sendMessage", { code: 400, description: "Bad Request: message text is empty" });
+      });
+      const result = await answer;
+      expect(result).toEqual({ decision: "deny", reason: notShownReason(RED) });
+      expect(String(field(result, "reason"))).toContain("as plain text");
+    });
+
+    test("a poll that ends before any answer keeps the texts it always had", async () => {
+      await startHub();
+      await enabled("a");
+      const answer = ask([Q1, Q3]);
+      await shown();
+      await hub.stop();
+      expect(await answer).toEqual({ decision: "deny", reason: askAgainReason("hubStopping") });
+      expect(askAgainReason("hubStopping")).not.toContain(ALREADY);
+    });
+
+    test("«Cancel» after an answer drops everything: the reason is the plain cancel text", async () => {
+      await startHub();
+      await enabled("a");
+      const answer = ask([Q1, Q3]);
+      const second = await answerRed();
+      await settle();
+      press(dataOf(second, 2, 1), fake.lastMessageId);
+      expect(await answer).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    });
+
+    test('a "!" message after an answer drops everything: the reason is the plain cancel text', async () => {
+      await startHub();
+      await enabled("a");
+      const answer = ask([Q1, Q3]);
+      await answerRed();
+      await settle();
+      say("!stop");
+      expect(await answer).toEqual({ decision: "deny", reason: CANCEL_REASON });
+    });
+
+    test("turning the mode off after an answer drops everything: the hook gets none", async () => {
+      await startHub();
+      const a = await enabled("a");
+      const answer = ask([Q1, Q3]);
+      await answerRed();
+      await settle();
+      await req(a, { op: "disable" });
+      expect(await answer).toEqual({ decision: "none" });
+    });
+
+    test("a hook that does not announce the stream gets a blank and one JSON, with the answers in the reason once", async () => {
+      await startHub();
+      await enabled("a");
+      const response = rawAsk([Q1, Q3]);
+      await answerRed();
+      await settle();
+      await hub.stop();
+      const text = await (await response).text();
+      expect(text.startsWith(" ")).toBe(true);
+      expect(text.includes("\n")).toBe(false);
+      expect(text).not.toContain('{"answered"');
+      expect(JSON.parse(text)).toEqual({ decision: "deny", reason: askAgainReason("hubStopping", RED) });
+      expect(occurrences(text, ALREADY)).toBe(1);
+    });
+
+    test("a hook that announces the stream gets each answer as a line at once, then the decision as the last line", async () => {
+      await startHub();
+      await enabled("a");
+      const stream = await askStreaming([Q1, Q3]);
+      expect(stream.res.headers.get(QUESTION_ACCEPTED_HEADER)).toBe("1");
+      const second = await answerRed();
+      // The answer is on the stream while the poll is still open (a hub that is killed has already said it).
+      await waitFor(() => stream.state.raw.includes('{"answered"'));
+      expect(stream.lines()).toEqual([frame("Which color?", "Red")]);
+      press(dataOf(second, 1), fake.lastMessageId);
+      await stream.finished;
+      expect(stream.lines()).toEqual([frame("Which color?", "Red"), frame("Which size?", "Large"), { decision: "allow", answers: { "Which color?": "Red", "Which size?": "Large" } }]);
+      expect(stream.state.raw.endsWith("\n")).toBe(true);
+    });
+
+    test("a hook that announces the stream gets the answer as a line, then a deny that names it once", async () => {
+      await startHub();
+      await enabled("a");
+      const stream = await askStreaming([Q1, Q3]);
+      await answerRed();
+      await settle();
+      await hub.stop();
+      await stream.finished;
+      expect(stream.lines()).toEqual([frame("Which color?", "Red"), { decision: "deny", reason: askAgainReason("hubStopping", RED) }]);
+      expect(occurrences(stream.state.raw, ALREADY)).toBe(1);
+    });
+
+    test("a hook that announces the stream gets no answer line when the owner cancels", async () => {
+      await startHub();
+      await enabled("a");
+      const stream = await askStreaming([Q1, Q3]);
+      const second = await answerRed();
+      await settle();
+      press(dataOf(second, 2, 1), fake.lastMessageId);
+      await stream.finished;
+      expect(stream.lines()).toEqual([frame("Which color?", "Red"), { decision: "deny", reason: CANCEL_REASON }]);
+    });
+
+    test("✍ stays on an answer sent as a line while the poll waits, and comes off when the hub's deny carries it", async () => {
+      await startHub();
+      await enabled("a");
+      const stream = await askStreaming([Q1, Q3]);
+      await shown();
+      const id = fake.nextMessageId;
+      say("mine");
+      await polled(2);
+      await waitFor(() => stream.state.raw.includes('{"answered"'));
+      await waitFor(() => fake.callsOf("setMessageReaction").length === 1);
+      await settle();
+      // The hub cannot know yet that the agent will get the answer: the hook may still end the wait itself.
+      expect(fake.callsOf("setMessageReaction")).toEqual([{ chat_id: GROUP, message_id: id, reaction: [{ type: "emoji", emoji: "✍" }] }]);
+      await hub.stop();
+      await stream.finished;
+      expect(stream.lines()[1]).toEqual({ decision: "deny", reason: askAgainReason("hubStopping", { "Which color?": "mine" }) });
+      await waitFor(() => fake.callsOf("setMessageReaction").length === 2);
+      expect(fake.callsOf("setMessageReaction")[1]).toEqual({ chat_id: GROUP, message_id: id, reaction: [] });
+    });
+
+    // The owner's typed words wait in memory up to the quiet window. A hub killed (not stopped) meanwhile must not
+    // lose them: they are kept in the terminal inbox from the moment they join the group, and marked seen only once
+    // they are an answer the hook has (its line was sent) or the agent has them. A kill is simulated by the files
+    // as they are at that instant, put back after a stop, for the next hub to start from.
+    describe("typed words and a hub that is killed", () => {
+      const inboxFile = () => join(dir, "terminal-inbox.json");
+      const inboxIds = () => (hub["terminalInbox"]?.entries() ?? []).flatMap(([, messages]) => messages.map(m => m.message_id));
+      async function startWithInbox() {
+        const file = join(dir, "poll-offset.json");
+        const rigDir = join(dir, "rig");
+        mkdirSync(rigDir, { recursive: true });
+        const clock = newClock();
+        await startHub({ catchUpMs: SHORT_CATCH_UP_MS, timers: clock, pollOffsetFile: file, rigDir });
+        const a = await enabled("a");
+        return { clock, a, file, rigDir };
+      }
+      async function showFirst(clock: Clock, a: Awaited<ReturnType<typeof plugin>>) {
+        await a.next("catchUp");
+        await clock.advance(SHORT_CATCH_UP_MS);
+        return await shown();
+      }
+      // The owner types: the update is handled and its offset saved, as it is long before any kill in practice.
+      async function typeWords(file: string, text: string): Promise<number> {
+        const update = say(text).update_id;
+        await updatesHandled();
+        await waitFor(() => (savedOffset(file)?.offset ?? 0) >= update, WAIT_MS, "the offset is saved");
+        return update;
+      }
+      async function killed(file: string, rigDir: string, a: Awaited<ReturnType<typeof plugin>>) {
+        const disk = { inbox: readFileSync(inboxFile(), "utf8"), offset: readFileSync(file, "utf8") };
+        await hub.stop();
+        a.close();
+        writeFileSync(inboxFile(), disk.inbox);
+        writeFileSync(file, disk.offset);
+        await startHub({ pollOffsetFile: file, rigDir });
+        return await plugin("a");
+      }
+      const inbound = (c: { messages: { type: string }[] }) => c.messages.filter(m => m.type === "inbound").map(m => field(m, "content"));
+
+      test("words waiting in their group survive a hub killed without a stop, and the next hub delivers them once", async () => {
+        const { clock, a, file, rigDir } = await startWithInbox();
+        const stream = askStreaming([Q1, Q3]);
+        await showFirst(clock, a);
+        await typeWords(file, "mine");
+        await waitFor(() => hub.busy().includes("answer groups"), WAIT_MS, "the answer waits in its group");
+        expect(inboxIds()).toHaveLength(1);
+        const second = await killed(file, rigDir, a);
+        await (await stream).finished;
+        expect((await second.next("inbound")).content).toBe("mine");
+        say("and then");
+        await updatesHandled();
+        await waitFor(() => inbound(second).length === 2, WAIT_MS, "the next message arrives");
+        expect(inbound(second)).toEqual(["mine", "and then"]);
+      });
+
+      test("words that became an answer sent to the hook are not delivered again by the next hub", async () => {
+        const { clock, a, file, rigDir } = await startWithInbox();
+        const stream = askStreaming([Q1, Q3]);
+        await showFirst(clock, a);
+        await typeWords(file, "mine");
+        await waitFor(() => hub.busy().includes("answer groups"), WAIT_MS, "the answer waits in its group");
+        await clock.advance(BATCH_QUIET_MS);
+        const open = await stream;
+        await waitFor(() => open.state.raw.includes('{"answered"'), WAIT_MS, "the answer is sent to the hook");
+        await waitFor(() => inboxIds().length === 0, WAIT_MS, "the words are marked seen");
+        const second = await killed(file, rigDir, a);
+        await open.finished;
+        say("and then");
+        await updatesHandled();
+        await waitFor(() => inbound(second).length === 1, WAIT_MS, "the next message arrives");
+        expect(inbound(second)).toEqual(["and then"]);
+      });
+
+      test("words that answered the last question of a poll the hook was not sent line by line are marked seen once the poll is decided", async () => {
+        const { clock, a, file, rigDir } = await startWithInbox();
+        const answer = ask([Q1]);
+        await showFirst(clock, a);
+        await typeWords(file, "mine");
+        await waitFor(() => hub.busy().includes("answer groups"), WAIT_MS, "the answer waits in its group");
+        expect(inboxIds()).toHaveLength(1);
+        await clock.advance(BATCH_QUIET_MS);
+        expect(await answer).toEqual({ decision: "allow", answers: { "Which color?": "mine" } });
+        await waitFor(() => inboxIds().length === 0, WAIT_MS, "the words are marked seen");
+        const second = await killed(file, rigDir, a);
+        say("and then");
+        await updatesHandled();
+        await waitFor(() => inbound(second).length === 1, WAIT_MS, "the next message arrives");
+        expect(inbound(second)).toEqual(["and then"]);
+      });
+
+      test("words that are an answer only in the hub's memory (no line sent to the hook) are still delivered after a kill", async () => {
+        const { clock, a, file, rigDir } = await startWithInbox();
+        const answer = ask([Q1, Q3]);
+        await showFirst(clock, a);
+        await typeWords(file, "mine");
+        await waitFor(() => hub.busy().includes("answer groups"), WAIT_MS, "the answer waits in its group");
+        await clock.advance(BATCH_QUIET_MS);
+        await shown(2);
+        expect(inboxIds()).toHaveLength(1);
+        const second = await killed(file, rigDir, a);
+        // The stop of the test's hub also ends the hook's wait (a real kill cuts it): that end is not what is checked.
+        await answer;
+        expect((await second.next("inbound")).content).toBe("mine");
+      });
+    });
   });
 
   // The window of session "a" with a terminal entrypoint, so that a dialog report of it is looked at.

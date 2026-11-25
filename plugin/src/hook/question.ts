@@ -24,14 +24,22 @@
 //  cut off before the acceptance header, "none" with the mode on) gets the
 //  plain-text reason, so the agent never loops.
 //  - Otherwise print nothing.
+//
+// The hook asks for the stream (QUESTION_STREAM_HEADER): a hub that knows it sends each answer the owner
+// gives as a line at once, and the decision as the last line. If the wait then ends for a technical reason that
+// only the hook sees (a lost connection, the hook's limit, an unreadable end), the answers received are named
+// in the deny, with the instruction to ask only the unanswered questions (all answered: they are the allow).
+// This end is the only place that adds them: a deny the hub sends is printed as is. A hub that does not know
+// the header sends one JSON at the end, and the texts are the same as before.
 import { z } from "zod";
 import { isAlive } from "../shared/process-alive.ts";
 import { hubPort, paths } from "../shared/config.ts";
-import { QUESTION_ACCEPTED_HEADER } from "../shared/protocol.ts";
-import { questionDecision } from "../shared/protocol-schema.ts";
+import { QUESTION_ACCEPTED_HEADER, QUESTION_STREAM_HEADER } from "../shared/protocol.ts";
+import { questionDecision, questionFrame } from "../shared/protocol-schema.ts";
 import { readSessionMode } from "../hub/sessions.ts";
 import { PARENT_CHECK_MS, QUESTION_DEADLINE_MS } from "./question-limits.ts";
-import { endedReason, HUB_UNREACHABLE_REASON } from "./question-reasons.ts";
+import { readLines } from "./question-lines.ts";
+import { endedReason, unreachableReason } from "./question-reasons.ts";
 import type { EndedWhy } from "./question-reasons.ts";
 
 // The part of the hook input the hub needs; the hub checks the questions.
@@ -74,18 +82,30 @@ async function decide(): Promise<Output | undefined> {
   const input = parsed.data;
   // A hub that sends no header is an older one: it answers only when the poll is over.
   let accepted = false;
-  // The one rule for a technical end; the persisted mode tells whether the owner counts on Telegram.
+  // The answers the hub sent as they were given (a hub that knows QUESTION_STREAM_HEADER), by question text.
+  // A Map, so a question named like an Object property stays an ordinary key.
+  const answered = new Map<string, string>();
+  const answersSoFar = () => Object.fromEntries(answered);
+  const allow = (answers: Record<string, string>): Output => ({ permissionDecision: "allow", permissionDecisionReason: "Answered in Telegram", updatedInput: { ...input.tool_input, answers } });
+  // Every question of the call has an answer: only the decision itself was missing.
+  const allAnswered = () => input.tool_input.questions.length > 0 && input.tool_input.questions.every(q => typeof (q as { question?: unknown })?.question === "string" && answered.has((q as { question: string }).question));
+  // The one rule for a technical end; the persisted mode tells whether the owner counts on Telegram. The reason
+  // is built here, from the answers received, so the hub never has to repeat them (and never does for a hook that
+  // ended the wait itself).
   const modeOn = () => readSessionMode(paths().sessionsFile, input.session_id) === true;
   const technicalEnd = (why: EndedWhy | "notTaken"): Output | undefined => {
     if (parentGone || !(accepted || modeOn())) return undefined;
-    return deny(why === "notTaken" ? HUB_UNREACHABLE_REASON : endedReason(why));
+    const answers = answersSoFar();
+    return deny(why === "notTaken" ? unreachableReason(answers) : endedReason(why, answers));
   };
+  // An end without a decision: when every question was already answered, those answers are the decision.
+  const endWithoutDecision = (why: EndedWhy | "notTaken"): Output | undefined => (!parentGone && accepted && allAnswered() ? allow(answersSoFar()) : technicalEnd(why));
   let res: Response;
   try {
     // timeout: false turns off Bun's 5-minute idle timer on the held request.
     res = await fetch(`http://127.0.0.1:${hubPort()}/question`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", [QUESTION_STREAM_HEADER]: "1" },
       body: JSON.stringify({
         messagingSocket: process.env.CLAUDE_CODE_MESSAGING_SOCKET,
         session_id: input.session_id,
@@ -102,17 +122,36 @@ async function decide(): Promise<Output | undefined> {
   }
   if (!res.ok) return technicalEnd("notTaken");
   accepted = res.headers.has(QUESTION_ACCEPTED_HEADER);
-  let body: string;
+  // The body is read as lines, whatever way it is cut into chunks: a hub that streams sends an answer frame per
+  // line and the decision as the last line; an older one sends one JSON without a newline. Only complete lines
+  // are taken while reading; the rest after the last newline is the decision of an older hub (taken at the end).
+  let decisionLine: string | undefined;
+  const take = (line: string) => {
+    const text = line.trim();
+    if (!text) return;
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      decisionLine = text;
+      return;
+    }
+    const frame = questionFrame.safeParse(value);
+    if (frame.success) answered.set(frame.data.answered.question, frame.data.answered.answer);
+    else decisionLine = text;
+  };
   try {
-    body = await res.text();
+    await readLines(res.body, take);
   } catch {
+    // A decision that arrived whole (a line ended by its newline) stands, even if the connection broke right after.
     // Asking again is for a hub that took the poll. A response cut off before the acceptance header is a hub
     // that never took it (or an older one), and the same cut would repeat by itself: the plain-text reason.
-    return technicalEnd(timedOut ? "timeLimit" : accepted ? "connectionLost" : "notTaken");
+    if (decisionLine === undefined) return endWithoutDecision(timedOut ? "timeLimit" : accepted ? "connectionLost" : "notTaken");
   }
+  if (decisionLine === undefined) return endWithoutDecision("notTaken");
   let decision;
   try {
-    decision = questionDecision.safeParse(JSON.parse(body));
+    decision = questionDecision.safeParse(JSON.parse(decisionLine));
   } catch {
     return technicalEnd("notTaken");
   }
@@ -120,9 +159,9 @@ async function decide(): Promise<Output | undefined> {
   const d = decision.data;
   // The terminal dialog opens only when the persisted mode is not on right now: a new hub answers none only
   // with the mode off, but an older one also does for technical ends, and then the owner reads Telegram.
-  if (d.decision === "none") return parentGone || !modeOn() ? undefined : deny(HUB_UNREACHABLE_REASON);
+  if (d.decision === "none") return parentGone || !modeOn() ? undefined : deny(unreachableReason(answersSoFar()));
   if (d.decision === "deny") return deny(d.reason);
-  return { permissionDecision: "allow", permissionDecisionReason: "Answered in Telegram", updatedInput: { ...input.tool_input, answers: d.answers } };
+  return allow(d.answers);
 }
 
 try {

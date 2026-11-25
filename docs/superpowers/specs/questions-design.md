@@ -55,6 +55,12 @@ of an ended poll answers "The poll is outdated" and removes the buttons, as with
 **Several questions.** One call can have up to 4 questions. They arrive one by one: the next one comes
 after the previous one is answered. The agent gets all the answers at once, when all are answered.
 
+A poll with several questions may end for a technical reason after some of its questions were answered (the hub stops,
+the window is gone, the connection is lost, the hook's time limit). Those answers are not lost: the deny names each
+answered question with its answer and tells the agent to ask only the unanswered ones, see "Answers carried by a
+technical end". The owner's own end drops everything: "✖️ Cancel", a message with "!" and turning the mode off carry no
+answers, as before.
+
 **Message.** With sound. Text: the question header (`header`), the question itself, below it the numbered
 options with descriptions. If an option has a `preview` (a code sample, a mockup), it goes under the option
 as a code block, cut to 700 characters. The message is always one, within the Telegram limit (4096
@@ -83,6 +89,11 @@ message belongs to the question shown when it came; if that question is over onc
 goes to the agent. The answer message gets the same ✍
 "not yet read" reaction as an ordinary incoming message; when the agent gets the answers, the hub removes it. If the poll
 ended without answers to the agent (cancel, move to the terminal), the ✍ stays: the agent did not read that message.
+A technical end that carries the answer in its deny (the hub's own ends) removes it too, because the agent has the
+answer. Where the hub cannot know, the old rule stands: an answer already sent to a streaming hook keeps its ✍ while the
+poll waits, and comes off only when the hub itself decides the poll (the allow, or a deny that carries it). If the hook
+ends the wait by itself afterwards (a lost connection, the time limit), the hub does not know whether the agent got
+the answer, so the ✍ stays; this is a known limit, not a loss of the answer.
 Commands (`/info`, `/compact`, `/pwsh` and so on) do not count as an answer, work as usual and do not
 close the poll; `/stop` ends the session, and its poll becomes outdated.
 
@@ -133,6 +144,18 @@ that does not know the header reads the body unchanged. A hub that refuses or ha
 `none` without the header. Aborting the request after the headers still reaches the hub (`req.signal`) and ends the
 poll with none and "ended on the terminal side".
 
+**Answer stream.** The hub on Windows is usually killed, not stopped, so it cannot hand the answers over when it ends.
+Instead it sends each accepted answer to the hook at once, over the response that is already open. A hook of the new
+version announces this with the request header `x-question-stream: 1` (`QUESTION_STREAM_HEADER`). The body of a
+streaming response is then lines, each ended by a newline: zero or more answer frames
+`{"answered":{"question":"<question text>","answer":"<answer>"}}` and the decision JSON (`allow`, `deny` or `none`) as
+the last line; the first chunk is still the single space. A hub writes a frame only when the request announced the
+stream; a frame counts as accepted only if the write succeeded. The hook reads the body as lines
+(`readLines`, `src/hook/question-lines.ts`): bytes are decoded as a stream, so a chunk cut anywhere, inside a UTF-8
+character too, gives the same lines; a line is taken only once its newline came; what remains after the last newline when the body
+ends is the decision of an older hub that sends no newline. A line that is an answer frame is kept (by question text,
+in a `Map`); any other line is the decision.
+
 **One rule for every technical end.** A technical end is any end of the wait that the hub did not decide: the hub
 cannot be reached, the connection dropped or closed before the headers, the answer has an error status, the body is not
 a valid decision, or the hook's own time limit ran out. One function in the hook (`technicalEnd`, `src/hook/question.ts`)
@@ -158,7 +181,10 @@ dialog except when nobody reads its output.
 
 **Mixed versions.** A new hook with a hub that sends no header (an older hub) never saw an acceptance, so step 3
 decides every end by the persisted mode. An explicit `none` from an older hub with the mode on is read
-the same way as from a new one (a refusal). An old hook with a new hub parses the body as JSON as before.
+the same way as from a new one (a refusal). An old hook with a new hub parses the body as JSON as before: it does not
+send the stream header, so the hub sends no frames, the body is the space and one JSON, and the hub's own technical ends
+still name the answers in the deny (the hub builds the whole text). A new hook with an older hub gets no frames and
+the texts are exactly as before; its own ends then carry no answers, since it received none.
 
 **Hub unreachable.** The request fails before any response (connection refused, or the connection closed before the
 headers) or the answer has an error status. The persisted mode is the `sessions.json` of the state directory; the hook
@@ -217,6 +243,10 @@ outlive the hub's knowledge of it.
 | Hub unreachable, closed the connection before acceptance or answered with an error status, mode off or unknown | none by silence: the hook prints nothing | nothing |
 | The parent process of the hook is gone | none by silence: nothing reads the output | ended on the terminal side |
 
+In the rows above, every deny from `hubStopping`, `windowGone`, `notShown`, the hook's connection lost, its time limit
+and an unreadable end names the answers already given when there are any (see "Answers carried by a technical end");
+the rows for cancel, "!", mode off and session restart carry none.
+
 A denied poll from the hub tells the agent why the question got no answer in Telegram, that nothing was answered and
 nothing was asked in the terminal, and to ask again with a single `AskUserQuestion` call. A refusal printed by the
 hook says the hub took the question, with the same facts. Pressing a button of a closed
@@ -227,6 +257,23 @@ The ask-again advice is given only for ends that need an outside event before th
 is the one end that could repeat on every new call with no outside event, so it is not an ask-again: the agent is told to
 write the question as plain text.
 
+**Answers carried by a technical end.** One text builder, `reasonWithAnswers` (`src/shared/question-answers.ts`), puts
+the answers into the reason of every technical end: `hubStopping`, `windowGone`, `notShown` on the hub side;
+`connectionLost`, `timeLimit` and an unreadable end after acceptance on the hook side. The producer of the deny builds
+the whole text and nobody appends to it later: the hub in `finishPoll` (the end takes a function of the answers, so
+there is one place for every hub-side end), the hook from the frames it received; the hook prints a deny the hub sent
+as it is, so the answers are never added twice, whichever version is on either side. With no answers the text is exactly
+the old one. With answers it is the opening sentence of the end, then `Already answered in Telegram, question and
+answer:` and one line `- "<question>": "<answer>"` per answered question, then the instruction to ask only the
+unanswered ones (for the plain-text ends: do not call `AskUserQuestion` for them, write only them as plain text). It
+never says that nothing was answered when something was. The text is for the agent, so it is English. Question and
+answer are JSON strings: a newline or a quote in a typed answer cannot be taken for the text around it, and the hook's
+output stays valid JSON. Answers are never cut, however long.
+
+When every question of the call was answered before the end and only the decision is missing, the hook's end is the
+allow with those answers instead of a deny. A frame for a question the call did not ask does not count toward that.
+The owner's cancel, the mode turned off and a session restart carry nothing.
+
 **A text answer waiting when the poll ends.** An owner's text that the hub took as the answer to a question (it waits in
 its answer group for the quiet time of a batch) must reach the agent, whatever ends the poll, and before any later
 message of the owner in the same session's flow of messages. `finishPoll`, the one place every poll ends, flushes the
@@ -236,6 +283,19 @@ it too. A flush of a group that is already gone is a no-op. This promises no ord
 an answer goes back to the agent as the result of its tool call, a message goes through the channel, and Claude Code reads
 a channel message only after the tool result, so the agent sees the answers of a poll before the words that ended an
 earlier one.
+
+**Words waiting in an answer group and a hub that is killed.** The quiet window of a group lasts up to 10 s, and a
+hub killed meanwhile would lose the words that only lived in memory. So the words go into the terminal inbox
+(`terminalInbox`, the same file that holds any topic message not yet seen by the agent) from the moment they join
+the group, and are marked seen only once the agent has them:
+- when they became an accepted answer that was written to the hook as a frame (the frame is written first, then the
+  words are marked seen; a kill between the two writes errs toward a duplicate, never a loss);
+- when the poll is decided (`finishPoll` marks what is left of its answers, for a hook that gets no frames), or when
+  they are delivered as an ordinary message and the agent reports it saw them.
+
+So after a kill the next hub delivers words that were only waiting, once, and does not deliver an accepted answer
+again. A frame that could not be written (the hook is gone) marks nothing seen. Nothing stays after the poll: the
+stream is dropped in `finishPoll` and the held ids are released.
 
 **A reply to a question that is still being sent.** A reply belongs to the question only if it came after the question
 message, which the hub tells by message ids. While the question message is on its way its id is not known yet, so a
@@ -311,5 +371,7 @@ reconnected: the hook denies and the agent asks again, which reaches the restart
 `q:<key>:<question number>:<action>`, the key is 8 hex characters, as with permissions. Pressing a button of a
 question that is not the current one counts as outdated.
 
-**State.** The hub keeps open polls in memory. A graceful stop denies them (ask again); a crash drops the connection,
-and the hook, which saw the acceptance, denies with the same advice, see the table.
+**State.** The hub keeps open polls in memory. A graceful stop denies them (ask again, naming the answers already given);
+a crash drops the connection, and the hook, which saw the acceptance, denies with the same advice and the answers it
+received as frames, see the table. The answers survive a kill on the hook side (the frames) and the words waiting in a
+group survive it in the terminal inbox; nothing else of a poll is kept across a hub restart.

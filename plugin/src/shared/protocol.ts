@@ -9,6 +9,11 @@ export const PROTOCOL_VERSION = 1;
 // hub that does not send it is an older one.
 export const QUESTION_ACCEPTED_HEADER = "x-question-accepted";
 
+// The request header with which a hook says that it reads the response as lines: each answer the owner gave
+// goes to it at once as a QuestionFrame line, and the decision follows as the last line. A hub that does not
+// know the header answers as before (one JSON); a hub sends nothing but one JSON to a hook without it.
+export const QUESTION_STREAM_HEADER = "x-question-stream";
+
 // The hub's localhost port unless TELEGRAM_HUB_PORT says otherwise. This file has no
 // imports, so hooks can use it too.
 export const DEFAULT_PORT = 47613;
@@ -124,6 +129,11 @@ export type QuestionDecision =
   | { decision: "allow"; answers: Record<string, string> }
   | { decision: "deny"; reason: string }
   | { decision: "none" };
+
+// One accepted answer of a poll, sent to a hook that asked for the stream (QUESTION_STREAM_HEADER) the moment
+// the hub took it, before the poll ends. If the hub is killed or the connection is lost afterwards, the hook
+// still has the answers given so far.
+export type QuestionFrame = { answered: { question: string; answer: string } };
 
 // Body the SessionStart hook POSTs to /hook.
 export type HookBody = {

@@ -4,7 +4,7 @@ import type { Logger } from "../shared/log.ts";
 import type { Entity, Formatted } from "../shared/markdown.ts";
 import type { OutFile } from "../shared/media.ts";
 import type { Language, Messages } from "../shared/i18n/index.ts";
-import type { AskQuestion, ChannelMeta, EnableResult, HookBody, HubToPlugin, PermissionBehavior, PluginToHub, QuestionDecision, ResolutionKind } from "../shared/protocol.ts";
+import type { AskQuestion, ChannelMeta, EnableResult, HookBody, HubToPlugin, PermissionBehavior, PluginToHub, QuestionDecision, QuestionFrame, ResolutionKind } from "../shared/protocol.ts";
 import type { PermissionMode, SessionProgress } from "./rig-session.ts";
 import type { OutItem, Piece } from "./outbox.ts";
 import type { Poll } from "./questions.ts";
@@ -32,7 +32,7 @@ import { field } from "../shared/guards.ts";
 import { catalogOf, DEFAULT_LANGUAGE } from "../shared/i18n/index.ts";
 import { literal, toTelegram } from "../shared/markdown.ts";
 import { albums, kindOf } from "../shared/media.ts";
-import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER } from "../shared/protocol.ts";
+import { PROTOCOL_VERSION, QUESTION_ACCEPTED_HEADER, QUESTION_STREAM_HEADER } from "../shared/protocol.ts";
 import { hookBody, pluginToHub, questionAsker, questionBody, sendFilesMessage, sendMessage, turnEndBody, turnFailedBody } from "../shared/protocol-schema.ts";
 import { loadCards, saveCards } from "./cards.ts";
 import { loadPollOffset, savePollOffset } from "./poll-offset.ts";
@@ -48,7 +48,9 @@ import { accountOf, SessionStore, topicName } from "./sessions.ts";
 import { isThreadNotFound, TelegramError } from "./telegram.ts";
 import { media, richPhotos, richToMarkdown } from "./rich.ts";
 import { withContext } from "./reply-context.ts";
-import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, dialogWarning, NOT_SHOWN_REASON, parsePollPress, POLL_PREFIX, questionButtons, questionText, SESSION_RESTARTING_REASON, withOutcome } from "./questions.ts";
+import type { Refusal } from "./questions.ts";
+
+import { answerLine, askAgainReason, CANCEL_REASON, checkedLabels, dialogWarning, notShownReason, parsePollPress, POLL_PREFIX, questionButtons, questionText, SESSION_RESTARTING_REASON, withOutcome } from "./questions.ts";
 import { richPieces } from "./rich-out.ts";
 import { DEFAULT_VIDEO_TOOLS, probeVideo, thumbPath } from "./video.ts";
 import { EXEC_CARD_MS, EXEC_CHECK_MS, EXEC_MAX_AGE_MS, Execs } from "./exec.ts";
@@ -578,7 +580,7 @@ export class Hub {
     // The next hub cannot answer an open poll, and a terminal dialog the owner cannot see must not open:
     // every poll is refused with a request to ask again, the waiting ones too. This ends them all in this
     // tick, so the words of the answers still waiting reach the batches before the flush below.
-    const refusal: QuestionDecision = { decision: "deny", reason: askAgainReason("hubStopping") };
+    const refusal: Refusal = answers => askAgainReason("hubStopping", answers);
     const refused = [...new Set([...this.polls.values()].map(p => p.sessionId))].map(sid => this.endPolls(sid, refusal, this.m().pollAskedAgain).settled);
     // Waiting batches go at once, while the windows are still connected; an
     // update handled meanwhile may start one more.
@@ -674,22 +676,42 @@ export class Hub {
       }
       // The answer may take hours; the hook's own timeout bounds the wait.
       server.timeout(req, 0);
-      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal, tool_use_id);
+      // A hook of the newer version says that it reads lines: it gets every accepted answer at once, so a hub
+      // killed before the poll ends does not take the answers with it. Any other hook gets one JSON, as always.
+      const streamed = req.headers.get(QUESTION_STREAM_HEADER) === "1";
+      const encoder = new TextEncoder();
+      let out: ReadableStreamDefaultController<Uint8Array> | undefined;
+      // False when the hook is gone (the stream is closed already) and the text went nowhere.
+      const write = (text: string): boolean => {
+        try {
+          if (!out) return false;
+          out.enqueue(encoder.encode(text));
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal, tool_use_id, streamed ? frame => write(`${JSON.stringify(frame)}\n`) : undefined);
       // The poll is accepted: the headers and a first blank chunk go out at once (a response streamed from
       // a ReadableStream sends its headers with the first chunk), so the hook knows the poll is open. The
-      // decision follows as JSON; JSON.parse skips the leading blank, so a hook that does not look at the
-      // header reads the body as before.
-      const encoder = new TextEncoder();
+      // decision follows as JSON (one line when the hook reads lines); JSON.parse skips the leading blank, so
+      // a hook that does not look at the header reads the body as before.
       const body = new ReadableStream<Uint8Array>({
         start: controller => {
+          out = controller;
           controller.enqueue(encoder.encode(" "));
         },
-        pull: async controller => {
-          const answer = JSON.stringify(await decision);
+        // Asked for once, when the first chunk is taken; the answer frames are written past it meanwhile.
+        pull: async () => {
+          const d = JSON.stringify(await decision);
+          write(streamed ? `${d}\n` : d);
           try {
-            controller.enqueue(encoder.encode(answer));
-            controller.close();
-          } catch {} // the hook went away and the stream is closed already
+            out?.close();
+          } catch {}
+          out = undefined; // nothing of the stream stays referenced once it ended
+        },
+        cancel: () => {
+          out = undefined; // the hook went away: nothing more is written
         },
       });
       return new Response(body, { headers: { "content-type": "application/json", [QUESTION_ACCEPTED_HEADER]: "1" } });
@@ -759,7 +781,7 @@ export class Hub {
   // dialogs goes. Called after the window is no longer counted as the session's.
   private releaseSession(sid: string): void {
     if (this.connOf(sid)) return;
-    this.endPolls(sid, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+    this.endPolls(sid, answers => askAgainReason("windowGone", answers), this.m().pollAskedAgain);
     this.forgetDialogs(sid);
   }
 
@@ -1169,10 +1191,11 @@ ${msg.text}`);
   // AskUserQuestion again while an earlier call still waits, so polls of one
   // session are served one after another: a later one waits unseen until the
   // earlier one ends, and an older poll is never ended by a newer one.
-  private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal, toolUseId?: string): Promise<QuestionDecision> {
+  // stream: where each accepted answer goes at once, for a hook that reads them (see QuestionFrame).
+  private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal, toolUseId?: string, stream?: (frame: QuestionFrame) => boolean): Promise<QuestionDecision> {
     const key = randomUUID().replaceAll("-", "").slice(0, PERMISSION_KEY_CHARS);
     return new Promise(resolve => {
-      const p: Poll = { key, sessionId, toolUseId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], done: false, resolve };
+      const p: Poll = { key, sessionId, toolUseId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], heldIds: [], stream, done: false, resolve };
       this.polls.set(key, p);
       this.takeCall(sessionId, toolUseId);
       if (signal.aborted) {
@@ -1262,7 +1285,7 @@ ${msg.text}`);
 
   // Ends every poll of the session with one decision, the waiting ones too, without starting any of them.
   // `settled` is when their messages show the outcome.
-  private endPolls(sessionId: string, decision: QuestionDecision, outcome: string): { polls: Poll[]; settled: Promise<void> } {
+  private endPolls(sessionId: string, decision: QuestionDecision | Refusal, outcome: string): { polls: Poll[]; settled: Promise<void> } {
     const polls = this.pollsOf(sessionId);
     const settled = Promise.all(polls.map(p => this.finishPoll(p, decision, outcome, false))).then(() => {});
     this.spawn(settled);
@@ -1298,9 +1321,22 @@ ${msg.text}`);
   // polls passes advance=false, since none is left to start. Every end goes through here, so this is the one
   // place that hands the poll's waiting text answer to the agent as ordinary messages: they were sent before
   // whatever the owner sends next, and go into the session's batch in this same tick, ahead of it.
-  private async finishPoll(p: Poll, decision: QuestionDecision, outcome: string, advance = true): Promise<void> {
+  //
+  // A Refusal is a deny for a technical end (the hub stopping, the window gone, the question not shown): its
+  // reason is built here from the answers the poll already got, so the agent gets them with the reason and asks
+  // only the rest. Whoever receives the deny prints it as it is: this is the one place that adds the answers
+  // to such an end, for an old hook and a new one alike. The owner's cancel, the mode turned off and a session
+  // restart carry nothing, since they drop the answers.
+  private async finishPoll(p: Poll, ending: QuestionDecision | Refusal, outcome: string, advance = true): Promise<void> {
     if (p.done) return;
     p.done = true;
+    const carried = typeof ending === "function" && Object.keys(p.answers).length > 0;
+    const decision: QuestionDecision = typeof ending === "function" ? { decision: "deny", reason: ending(p.answers) } : ending;
+    // The poll has no more answers to stream; what it holds goes with it.
+    p.stream = undefined;
+    // Words kept in the inbox for the answers of this poll: the answers are with the agent (or dropped by the
+    // owner's own word) now, so the next hub must not deliver them.
+    this.markHeldSeen(p);
     this.polls.delete(p.key);
     this.forgetDialogs(p.sessionId);
     this.trimCalls(this.taken, p.sessionId);
@@ -1310,8 +1346,8 @@ ${msg.text}`);
     if (advance) this.startNext(p.sessionId);
     p.outcomes[p.index] = outcome;
     p.resolve(decision);
-    // The agent has the answers now; with none, it never gets them.
-    if (decision.decision === "allow") for (const id of p.taken) this.clearTaken(id);
+    // The agent has the answers now (in the allow, or in the reason of a technical deny); with none, it never gets them.
+    if (decision.decision === "allow" || carried) for (const id of p.taken) this.clearTaken(id);
     this.log.info(`question poll ${p.key} of session ${p.sessionId}: ${decision.decision}`);
     await Promise.all([flushed, this.showOutcome(p, p.index)]);
   }
@@ -1328,9 +1364,22 @@ ${msg.text}`);
     await api.editMessageText(groupId, id, f.text, f.entities).catch(e => this.log.warn(`editing a question message failed: ${e}`));
   }
 
+  // The words of the answers a poll took stay in the terminal inbox (a killed hub does not lose them) until
+  // they reached the agent: they are marked seen once the answer is with the hook (see answerPoll) or the poll
+  // ends. A kill between the frame and this mark leaves them in the inbox, so the next hub may deliver them
+  // once more: an answer can come twice in that instant, never get lost.
+  private markHeldSeen(p: Poll): void {
+    if (!p.heldIds?.length) return;
+    this.terminalInbox?.seen(p.heldIds);
+    p.heldIds = [];
+  }
+
   private async answerPoll(p: Poll, answer: string): Promise<void> {
     const q = p.questions[p.index];
     p.answers[q.question] = answer;
+    // A hook that reads the stream has the answer the moment it is accepted, so a hub killed after this cannot
+    // take it back. The frame goes first, then the words are marked seen: the other order could lose them.
+    if (p.stream?.({ answered: { question: q.question, answer } })) this.markHeldSeen(p);
     if (p.index + 1 < p.questions.length) {
       const i = p.index;
       p.outcomes[i] = answerLine(answer);
@@ -1356,7 +1405,7 @@ ${msg.text}`);
     const known = parsed ? this.polls.get(parsed.key) : undefined;
     // Nobody is left to take the answer: the session's polls are refused with a request to ask again and the button is stale.
     const closed = known && !this.connOf(known.sessionId);
-    if (known && closed) this.endPolls(known.sessionId, { decision: "deny", reason: askAgainReason("windowGone") }, this.m().pollAskedAgain);
+    if (known && closed) this.endPolls(known.sessionId, answers => askAgainReason("windowGone", answers), this.m().pollAskedAgain);
     // Only the shown poll of a session takes presses; a waiting one has no message.
     const p = closed || !known?.started ? undefined : known;
     const q = p?.questions[p.index];
@@ -1808,7 +1857,7 @@ ${msg.text}`);
     // next poll of the session, if any, is shown.
     const pollKey = item.notice ? undefined : POLL_ITEM.exec(item.id)?.[1];
     const poll = pollKey ? this.polls.get(pollKey) : undefined;
-    if (poll) this.spawn(this.finishPoll(poll, { decision: "deny", reason: NOT_SHOWN_REASON }, this.m().pollNotShown));
+    if (poll) this.spawn(this.finishPoll(poll, answers => notShownReason(answers), this.m().pollNotShown));
     if (item.notice) {
       this.outbox.remove(item.id);
       this.settled(item);
@@ -2109,6 +2158,12 @@ ${msg.text}`);
 
   // An answer message waits for the ones sent with it, like a batch.
   private addAnswer(api: TelegramApi, p: Poll, m: Message, part: string): void {
+    // Before anything changes, like every other way a message is kept: a stopped hub neither groups nor keeps it.
+    this.assertDeliveryOpen();
+    // The words wait in memory up to the quiet window, so a hub killed meanwhile would lose them: they are kept
+    // on disk like any topic message from the moment they join, and marked seen once they are an answer the hook
+    // has (see markHeldSeen) or the agent has them.
+    this.terminalInbox?.add(p.sessionId, m);
     const g = this.answerGroups.get(p.key);
     if (g && g.index === p.index) {
       g.messages.push(m);
@@ -2144,6 +2199,8 @@ ${msg.text}`);
         p.taken.push(m.message_id);
       }
     }
+    // Kept in the inbox until the answer is out (answerPoll) or the poll ends.
+    p.heldIds = [...(p.heldIds ?? []), ...g.messages.map(m => m.message_id)];
     await this.answerPoll(p, g.parts.join("\n\n"));
   }
 

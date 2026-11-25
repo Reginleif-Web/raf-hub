@@ -1,7 +1,7 @@
 // Runtime checks of the protocol messages, typed against protocol.ts: a
 // message type changed on one side and not here fails the type check.
 // protocol.ts itself has no value imports, so hooks can use it.
-import type { AskQuestion, EnableResult, HookBody, HubToPlugin, PluginToHub, QuestionBody, QuestionDecision, QueuedFile, TurnEndBody, TurnFailedBody } from "./protocol.ts";
+import type { AskQuestion, EnableResult, HookBody, HubToPlugin, PluginToHub, QuestionBody, QuestionDecision, QuestionFrame, QueuedFile, TurnEndBody, TurnFailedBody } from "./protocol.ts";
 
 import { z } from "zod";
 import { entitySchema } from "./markdown.ts";
@@ -90,6 +90,8 @@ export const questionBody: z.ZodType<QuestionBody> = z.object({
 
 // Who asked, read from a body that questionBody refused: enough to know which call it was.
 export const questionAsker = z.object({ messagingSocket: z.string().optional(), session_id: z.string(), tool_use_id: z.string().optional() });
+
+export const questionFrame: z.ZodType<QuestionFrame> = z.object({ answered: z.object({ question: z.string(), answer: z.string() }) });
 
 export const questionDecision: z.ZodType<QuestionDecision> = z.union([
   z.object({ decision: z.literal("allow"), answers: z.record(z.string(), z.string()) }),
