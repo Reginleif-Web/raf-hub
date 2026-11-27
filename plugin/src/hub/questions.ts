@@ -86,6 +86,8 @@ export type Poll = {
   sessionId: string;
   // The tool call it asks for (an older hook sends no id).
   toolUseId?: string | undefined;
+  // The registry inquiry the question belongs to (G9), when the tool input names one.
+  inquiry?: string | undefined;
   started: boolean;
   questions: AskQuestion[];
   answers: Record<string, string>;

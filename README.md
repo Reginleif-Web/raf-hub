@@ -419,6 +419,44 @@ $global:TelegramHubChannelArgs = @('--channels', 'plugin:telegram-hub@telegram-h
 
 The downside: the file applies to the whole machine and all profiles, and only an administrator can edit it.
 
+## Optional: link to the Agent Factory
+
+The hub can work with the Agent Factory API: it mirrors messages, polls and session states to it, registers polls with
+the registry, takes poll answers back from it, runs the registry gate before a question, and carries the buttons of
+factory clients. It is off until you set it. With nothing set below, the hub behaves exactly as without this section.
+The design is in `docs/superpowers/specs/factory-relay-design.md`.
+
+Secrets are read from the environment or from the same `.env` file as the bot token, never from `config.json` and
+never from the repository:
+
+```
+TELEGRAM_HUB_FACTORY_URL=https://factory.example/api
+TELEGRAM_HUB_FACTORY_HUB_TOKEN=<the hub-role token of the factory>
+TELEGRAM_HUB_FACTORY_RELAY_TOKEN=<the relay-role token, optional: without it polls are not registered>
+TELEGRAM_HUB_BUTTON_KEYS=alpha=<key of client alpha>,beta=<key of client beta>
+```
+
+The link to the API is on when the URL and the hub token are both set. The button endpoints (`/buttons/*`) are on
+only when at least one client key is set. The non-secret settings go into an optional `factory` object of `config.json`:
+
+```json
+{
+  "factory": {
+    "pollAnswerIntervalMs": 5000,
+    "requestTimeoutMs": 10000,
+    "registryTimeoutMs": 3000,
+    "pressWindowMs": 600000,
+    "gate": { "command": ["registry-gate", "--inquiry", "{inquiry_id}"], "timeoutMs": 3000 }
+  }
+}
+```
+
+All numbers are optional; the values above are the defaults. `gate.command` is an argument list that the hub runs on
+every question before showing it (`{session_id}`, `{tool_use_id}` and `{inquiry_id}` are replaced in each element).
+It gets `{"session_id", "tool_use_id", "tool_input"}` on standard input and prints `{"pass": true}` or
+`{"pass": false, "reason": "...", "records": [...]}`; a refusal goes back to the model with the reason. A gate that
+fails, is slow or prints something else lets the question pass. Restart the hub after changing any of this.
+
 ## Language
 
 The hub's texts in Telegram (bot messages, buttons, card labels) are in English by default.

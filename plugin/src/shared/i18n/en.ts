@@ -61,6 +61,10 @@ export const en = {
   permissionStale: "The request is outdated",
   permissionNotDelivered: "⚠️ The session is not active, the answer was not delivered",
 
+  // Buttons of a client of the factory (a press is accepted once).
+  buttonAccepted: "✅ Accepted",
+  buttonRefused: "This button was already used or is no longer valid",
+
   // Polls (AskUserQuestion).
   pollCustomHint: "Write the answer in the next message",
   pollStale: "The poll is outdated",

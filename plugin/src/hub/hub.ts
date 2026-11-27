@@ -20,6 +20,9 @@ import type { Platform } from "../shared/platform.ts";
 import type { MachineCommand, RigInvocation, RigOutput, RigProgress, RigResult } from "./rig.ts";
 import type { MachineDestination, RigConfirmation } from "./machine-outbox.ts";
 import type { Timers } from "../shared/timers.ts";
+import type { FactoryFetch } from "./factory-client.ts";
+import type { FactorySettings } from "./factory-config.ts";
+import type { GateRun } from "./factory-gate.ts";
 
 import { randomUUID } from "crypto";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, unlinkSync } from "fs";
@@ -64,6 +67,9 @@ import { RigEvents, RIG_POLL_MS } from "./rig-events.ts";
 import { hubCommit, RigLifecycle, startedCommit } from "./rig-lifecycle.ts";
 import { TerminalRelay } from "./terminal-relay.ts";
 import { TerminalInbox, transcriptMessageIds } from "./terminal-inbox.ts";
+import { BUTTON_PREFIX } from "./factory-buttons.ts";
+import { inquiryId, spawnGate } from "./factory-gate.ts";
+import { type AnswerOutcome, FactoryRelay } from "./factory-relay.ts";
 
 // The queue id prefix of the start notice, "starting the session".
 const LAUNCH_NOTICE = "launch-";
@@ -258,6 +264,11 @@ export type HubOptions = {
   findRig?(): string | undefined;
   runRig?(invocation: RigInvocation, signal?: AbortSignal, progress?: RigProgress): Promise<RigOutput>;
   hubCommit?(): string | undefined;
+  // The link to the factory API, set up by the owner (see docs/superpowers/specs/factory-relay-design.md). Without it the hub does nothing of that.
+  factory?: FactorySettings;
+  // The fetch of the factory API and the gate command runner; the real ones by default, tests inject fakes.
+  factoryFetch?: FactoryFetch;
+  factoryGate?: GateRun;
   onExit(code?: number): void;
 };
 
@@ -412,6 +423,8 @@ export class Hub {
   private timers: Timers;
   private terminals?: TerminalRelay;
   private terminalInbox?: TerminalInbox;
+  // Only built when the owner configured the factory link; without it the hub behaves as before.
+  private factory?: FactoryRelay;
 
   constructor(private opts: HubOptions) {
     this.timers = opts.timers ?? realTimers;
@@ -441,6 +454,16 @@ export class Hub {
       setTimer: (fn, ms) => this.setTimer(fn, ms), clearTimer: timer => this.clearTimer(timer), messages: () => this.m() });
     this.machineOutbox = new MachineOutbox(join(dirname(opts.outboxFile), "machine-outbox.json"), text => this.log.warn(text));
     this.disableConfirmations = new Map(this.machineOutbox.confirmations());
+    if (opts.factory) this.factory = new FactoryRelay({ settings: opts.factory, dir: dirname(opts.outboxFile), timers: this.timers,
+      fetchFn: opts.factoryFetch ?? ((url, init) => fetch(url, init)), warn: text => this.log.warn(text), gateRun: opts.factoryGate ?? spawnGate,
+      groupId: () => opts.config().groupId,
+      postButtons: (id, text, buttons, topicId) => {
+        const group = opts.config().groupId;
+        if (!group) return;
+        this.machineOutbox.post(id, topicId === undefined ? { chatId: group } : { chatId: group, topicId }, text, false, buttons);
+        if (this.botReady && opts.api) this.spawn(this.machineOutbox.flush(opts.api));
+      },
+      applyAnswer: (pollKey, index, answerKey) => this.applyFactoryAnswer(pollKey, index, answerKey) });
     if (opts.rigDir) {
       const head = opts.hubCommit ?? (() => hubCommit(opts.repository ?? join(import.meta.dir, "..", "..", "..")));
       // The commit of the code that was loaded: the service script fixes it before `bun` starts; without it HEAD at start is the best guess.
@@ -559,6 +582,7 @@ export class Hub {
     this.machineQueries++;
     this.spawn(this.readLanguage().then(() => this.refreshFeatures()).finally(() => this.endMachineQuery()));
     this.spawn(this.rigTick());
+    this.factory?.start();
     this.armIdle();
     if (this.opts.api) void this.pollLoop(this.opts.api);
     else this.log.error("no TELEGRAM_BOT_TOKEN — not polling Telegram");
@@ -602,6 +626,8 @@ export class Hub {
     for (const t of this.reactionTimers.values()) this.clearTimer(t);
     // The commands go on; the next hub picks them up.
     this.execs?.stop();
+    // Records not yet sent stay in the durable queue for the next hub.
+    this.factory?.stop();
     this.server?.stop(true);
     this.log.info("hub stopped");
   }
@@ -662,6 +688,14 @@ export class Hub {
       }
       const { messagingSocket, session_id: hookSession, tool_input, tool_use_id } = r.data;
       const sessionId = this.questionSession(messagingSocket, hookSession);
+      // The registry gate (G9) runs first, with or without Telegram mode; a refusal ends the call here.
+      if (this.factory) {
+        const verdict = await this.factory.gate(sessionId, tool_use_id, field(raw, "tool_input"));
+        if (!verdict.pass) {
+          if (this.store.get(sessionId)?.enabled) this.takeCall(sessionId, tool_use_id);
+          return Response.json({ decision: "deny", reason: verdict.reason } satisfies QuestionDecision);
+        }
+      }
       if (!this.store.get(sessionId)?.enabled) return Response.json({ decision: "none" });
       // A stopping hub opens no poll: the next hub could not answer it.
       if (!this.running) {
@@ -691,7 +725,7 @@ export class Hub {
           return false;
         }
       };
-      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal, tool_use_id, streamed ? frame => write(`${JSON.stringify(frame)}\n`) : undefined);
+      const decision = this.askQuestion(sessionId, tool_input.questions, req.signal, tool_use_id, streamed ? frame => write(`${JSON.stringify(frame)}\n`) : undefined, inquiryId(field(raw, "tool_input")));
       // The poll is accepted: the headers and a first blank chunk go out at once (a response streamed from
       // a ReadableStream sends its headers with the first chunk), so the hook knows the poll is open. The
       // decision follows as JSON (one line when the hook reads lines); JSON.parse skips the leading blank, so
@@ -715,6 +749,11 @@ export class Hub {
         },
       });
       return new Response(body, { headers: { "content-type": "application/json", [QUESTION_ACCEPTED_HEADER]: "1" } });
+    }
+    // Buttons for a client of the factory (D5): only when the owner configured client keys, else the 404 below.
+    if (url.pathname.startsWith("/buttons/")) {
+      const handled = await this.factory?.handleButtons(req, url);
+      if (handled) return handled;
     }
     return new Response("not found", { status: 404 });
   }
@@ -922,8 +961,10 @@ export class Hub {
       // delivered whatever the mode is now. The ack goes once it is on disk.
       case "send": {
         const target = msg.sessionId ?? sid;
-        if (target) this.enqueue(target, msg.id, msg.text, msg.notify);
-        else this.log.warn(`text from a window that has not said hello, not sent:
+        if (target) {
+          this.enqueue(target, msg.id, msg.text, msg.notify);
+          this.factory?.mirrorMessage(target, msg.id, msg.text);
+        } else this.log.warn(`text from a window that has not said hello, not sent:
 ${msg.text}`);
         this.send(ws, { type: "ack", id: msg.id });
         return;
@@ -934,6 +975,8 @@ ${msg.text}`);
         return;
       case "permission":
         if (sid && this.store.get(sid)?.enabled) this.askPermission(sid, msg);
+        // A tool permission prompt reaches the factory only as the state "permission_wait", never as a poll or a message.
+        if (sid) this.factory?.mirrorState(sid, "permission_wait");
         return;
       case "title":
         if (sid) this.spawn(this.chain(sid, () => this.retitle(sid, msg.title)));
@@ -1175,10 +1218,26 @@ ${msg.text}`);
     if (ws) {
       this.permissions.delete(m[1]);
       this.send(ws, { type: "permissionReply", requestId: p.requestId, behavior });
+      this.factory?.mirrorState(p.sessionId, "active");
       this.log.info(`permission ${p.requestId} of session ${p.sessionId}: ${behavior} by ${press.fromId}`);
     }
     await api.answerCallbackQuery(press.id, outcome).catch(e => this.log.warn(`answering a button press failed: ${e}`));
     await api.editMessageText(groupId, press.messageId, `${p.text}\n\n${outcome}`, p.entities).catch(e => this.log.warn(`editing a permission message failed: ${e}`));
+  }
+
+  // A button a client of the factory put into the topic (D5): the press is accepted once, and a replayed, expired
+  // or foreign press is refused. The relay decides; the hub only tells the owner and takes the keyboard away.
+  private async onButtonPress(api: TelegramApi, groupId: string, press: { id: string; data: string; messageId: number; fromId: string }): Promise<void> {
+    const warn = (what: string) => (e: unknown) => this.log.warn(`${what} failed: ${e}`);
+    const result = this.factory ? this.factory.press(press.data.slice(BUTTON_PREFIX.length), press.fromId) : ({ ok: false, reason: "unknown" } as const);
+    if (result.ok) {
+      this.log.info(`button press ${press.id} accepted from ${press.fromId}`);
+      await api.answerCallbackQuery(press.id, this.m().buttonAccepted).catch(warn("answering a button press"));
+      return;
+    }
+    this.log.info(`button press ${press.id} refused (${result.reason}) from ${press.fromId}`);
+    await api.answerCallbackQuery(press.id, this.m().buttonRefused).catch(warn("answering a button press"));
+    if (result.reason !== "used") await api.removeKeyboard(groupId, press.messageId).catch(warn("removing the buttons"));
   }
 
   // --- questions ------------------------------------------------------------
@@ -1192,10 +1251,10 @@ ${msg.text}`);
   // session are served one after another: a later one waits unseen until the
   // earlier one ends, and an older poll is never ended by a newer one.
   // stream: where each accepted answer goes at once, for a hook that reads them (see QuestionFrame).
-  private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal, toolUseId?: string, stream?: (frame: QuestionFrame) => boolean): Promise<QuestionDecision> {
+  private askQuestion(sessionId: string, questions: AskQuestion[], signal: AbortSignal, toolUseId?: string, stream?: (frame: QuestionFrame) => boolean, inquiry?: string): Promise<QuestionDecision> {
     const key = randomUUID().replaceAll("-", "").slice(0, PERMISSION_KEY_CHARS);
     return new Promise(resolve => {
-      const p: Poll = { key, sessionId, toolUseId, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], heldIds: [], stream, done: false, resolve };
+      const p: Poll = { key, sessionId, toolUseId, inquiry, started: false, questions, answers: {}, index: 0, checked: new Set(), messageIds: [], outcomes: [], taken: [], heldIds: [], stream, done: false, resolve };
       this.polls.set(key, p);
       this.takeCall(sessionId, toolUseId);
       if (signal.aborted) {
@@ -1279,8 +1338,21 @@ ${msg.text}`);
     if (!p || p.started) return;
     p.started = true;
     this.spawn(this.catchUp(sessionId, p.key).then(() => {
-      if (!p.done) this.queueQuestion(p);
+      if (!p.done) return this.showQuestion(p);
     }));
+  }
+
+  // Queues the question shown now. With the factory link the registry first registers it (a slow or down registry
+  // only costs its short timeout) so its display line can go with the text; without the link it is queued at once.
+  private showQuestion(p: Poll): Promise<void> {
+    if (!this.factory) {
+      this.queueQuestion(p);
+      return Promise.resolve();
+    }
+    const index = p.index;
+    return this.factory.register(p.key, index, p.inquiry, p.questions[index]).then(() => {
+      if (!p.done && p.index === index) this.queueQuestion(p);
+    });
   }
 
   // Ends every poll of the session with one decision, the waiting ones too, without starting any of them.
@@ -1311,10 +1383,22 @@ ${msg.text}`);
     });
   }
 
+  // The text of question i as shown: the registry's display line, when the question was registered, goes above it
+  // and the entities move down with the text.
+  private questionFormatted(p: Poll, i: number): Formatted {
+    const shown = questionText(this.m(), p.questions, i);
+    const line = this.factory?.displayLine(p.key, i);
+    if (!line) return shown;
+    return { text: `${line}\n${shown.text}`, entities: shown.entities.map(e => ({ ...e, offset: e.offset + line.length + 1 })) };
+  }
+
   private queueQuestion(p: Poll): void {
-    const f = questionText(this.m(), p.questions, p.index);
+    const f = this.questionFormatted(p, p.index);
     const piece = { text: f.text, silent: !notifies("action"), buttons: questionButtons(this.m(), p), ...(f.entities.length ? { entities: f.entities } : {}) };
-    if (this.outbox.add(`poll:${p.key}:${p.index}`, p.sessionId, [piece])) this.spawn(this.pump(p.sessionId));
+    if (this.outbox.add(`poll:${p.key}:${p.index}`, p.sessionId, [piece])) {
+      this.factory?.mirrorPoll(p.sessionId, p.key, p.index, p.questions[p.index]);
+      this.spawn(this.pump(p.sessionId));
+    }
   }
 
   // Ends one poll. By default the next poll of the session, if any, starts; a bulk end of the session's
@@ -1350,6 +1434,8 @@ ${msg.text}`);
     if (decision.decision === "allow" || carried) for (const id of p.taken) this.clearTaken(id);
     this.log.info(`question poll ${p.key} of session ${p.sessionId}: ${decision.decision}`);
     await Promise.all([flushed, this.showOutcome(p, p.index)]);
+    // The registry's display lines are needed until the last outcome is shown.
+    this.factory?.forget(p.key);
   }
 
   // A sent question shows its outcome instead of the buttons; one still in
@@ -1360,7 +1446,7 @@ ${msg.text}`);
     const api = this.opts.api;
     const groupId = this.opts.config().groupId;
     if (id === undefined || outcome === undefined || !api || !groupId) return;
-    const f = withOutcome(questionText(this.m(), p.questions, i), outcome);
+    const f = withOutcome(this.questionFormatted(p, i), outcome);
     await api.editMessageText(groupId, id, f.text, f.entities).catch(e => this.log.warn(`editing a question message failed: ${e}`));
   }
 
@@ -1376,9 +1462,12 @@ ${msg.text}`);
     this.spawn(new Promise<void>(resolve => setImmediate(resolve)).then(() => this.terminalInbox?.seen(ids)));
   }
 
-  private async answerPoll(p: Poll, answer: string): Promise<void> {
+  // `chosen` are the 1-based options of a button answer; the factory link mirrors them as the poll's result, unless the
+  // answer came from the factory itself (mirror=false).
+  private async answerPoll(p: Poll, answer: string, chosen?: number[], mirror = true): Promise<void> {
     const q = p.questions[p.index];
     p.answers[q.question] = answer;
+    if (this.factory && mirror && chosen) this.factory.mirrorPollResult(p.key, p.index, chosen.map(a => a - 1));
     // A hook that reads the stream has the answer the moment it is accepted, so a hub killed after this cannot
     // take it back. The frame goes first, then the words are marked seen: the other order could lose them.
     if (p.stream?.({ answered: { question: q.question, answer } })) this.markHeldSeen(p);
@@ -1391,11 +1480,25 @@ ${msg.text}`);
       // agent now, ahead of whatever the owner sends while the next question is not shown yet. When this
       // answer came from the group itself, the group is already taken and this does nothing.
       const flushed = this.takeAnswer(p.key);
-      this.queueQuestion(p);
-      await Promise.all([flushed, this.showOutcome(p, i)]);
+      await Promise.all([flushed, this.showQuestion(p), this.showOutcome(p, i)]);
       return;
     }
     await this.finishPoll(p, { decision: "allow", answers: { ...p.answers } }, answerLine(answer));
+  }
+
+  // An answer to the shown question that came from the factory (a poll-answer request), not from a button of
+  // the topic. It is applied only to the question shown now ("closed" otherwise) and only when it names options
+  // the question has ("invalid" otherwise); it is not mirrored back to the factory, which has it already.
+  private applyFactoryAnswer(pollKey: string, index: number, answerKey: string): AnswerOutcome {
+    const p = this.polls.get(pollKey);
+    const q = p?.questions[p.index];
+    if (!p || !q || p.done || !p.started || p.index !== index || !this.connOf(p.sessionId)) return "closed";
+    const picked = FactoryRelay.answerIndexes(answerKey, q.options.length, q.multiSelect === true);
+    if (!picked) return "invalid";
+    const numbers = picked.map(i => i + 1);
+    const label = q.multiSelect ? checkedLabels(q, new Set(numbers)) : q.options[picked[0]].label;
+    this.spawn(this.answerPoll(p, label, numbers, false));
+    return "applied";
   }
 
   // A button under a question. The poll changes before any await, so a
@@ -1436,20 +1539,23 @@ ${msg.text}`);
         await ack(this.m().pollPickOne);
         return;
       }
-      const done = this.answerPoll(p, checkedLabels(q, p.checked));
+      const picked = [...p.checked].sort((a, b) => a - b);
+      this.factory?.capture(p.key, p.index, press.id, press.fromId, picked.map(a => a - 1));
+      const done = this.answerPoll(p, checkedLabels(q, p.checked), picked);
       await ack();
       await done;
       return;
     }
     if (!q.multiSelect) {
-      const done = this.answerPoll(p, q.options[action - 1].label);
+      this.factory?.capture(p.key, p.index, press.id, press.fromId, [action - 1]);
+      const done = this.answerPoll(p, q.options[action - 1].label, [action]);
       await ack();
       await done;
       return;
     }
     if (p.checked.has(action)) p.checked.delete(action);
     else p.checked.add(action);
-    const f = questionText(this.m(), p.questions, p.index);
+    const f = this.questionFormatted(p, p.index);
     const buttons = questionButtons(this.m(), p);
     await ack();
     await api.editMessageText(groupId, press.messageId, f.text, f.entities, buttons).catch(warn("editing a question message"));
@@ -1951,6 +2057,8 @@ ${msg.text}`);
           }
           online = wasOnline = true;
           this.botReady = true;
+          // A button message a client of the factory asked for before the bot was ready goes out now, not at the next rig tick.
+          if (this.factory) this.spawn(this.machineOutbox.flush(api));
           if (this.terminals) this.spawn(this.terminals.scan());
           this.rigLifecycle?.ready();
           failures = 0;
@@ -2036,6 +2144,7 @@ ${msg.text}`);
     if (press?.data.startsWith("rig-disable:")) return this.onRigDisablePress(api, press);
     if (press?.data.startsWith("m:")) return this.onModePress(api, press);
     if (press?.data.startsWith(POLL_PREFIX) && cfg.groupId) return this.onPollPress(api, cfg.groupId, press);
+    if (press?.data.startsWith(BUTTON_PREFIX) && cfg.groupId && this.factory?.hasButtons) return this.onButtonPress(api, cfg.groupId, press);
     if (press && cfg.groupId) return this.onPermissionPress(api, cfg.groupId, press);
     const route = routeUpdate(u, cfg, this.store, id => this.isConnected(id), this.botUsername);
     const m = u.message;
@@ -2971,6 +3080,7 @@ ${msg.text}`);
       ["replays", this.replays.size > 0],
       ["card edits", [...this.cards.values()].some(card => card.editing)],
       ["exec starts", (this.execs?.starting() ?? 0) > 0],
+      ["factory link", this.factory?.busy ?? false],
     ];
     return parts.filter(([, on]) => on).map(([name]) => name);
   }
@@ -2987,7 +3097,8 @@ ${msg.text}`);
       && !this.replays.size && !this.batches.size && !this.batchSends.size && !this.answerGroups.size
       && this.deliverable() === 0 && !this.pumping.size && ![...this.cards.values()].some(card => card.editing)
       && !this.machineOutbox.size && !this.machineOutbox.busy && !this.rigEvents?.busy
-      && ![...this.disableConfirmations.values()].some(item => item.recovery !== undefined);
+      && ![...this.disableConfirmations.values()].some(item => item.recovery !== undefined)
+      && !this.factory?.busy;
   }
 
   private async rigStage(name: string, run: () => Promise<void>): Promise<void> {

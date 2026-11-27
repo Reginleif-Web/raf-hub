@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { apiBase, hubPort, idleMs, loadConfig, loadToken, paths } from "../shared/config.ts";
 import { createLogger } from "../shared/log.ts";
+import { loadFactorySettings } from "./factory-config.ts";
 import { Hub } from "./hub.ts";
 import { installCrashLogging, installStopSignals, makeStop } from "./process-guard.ts";
 import { TelegramApi } from "./telegram.ts";
@@ -14,6 +15,7 @@ const log = createLogger(p.logFile, "hub");
 installCrashLogging(process, log);
 
 const token = loadToken();
+const factory = loadFactorySettings();
 const hub = new Hub({
   port: hubPort(),
   sessionsFile: p.sessionsFile,
@@ -33,6 +35,8 @@ const hub = new Hub({
   // --always-on: started by the Task Scheduler (scripts/install-hub-task.ps1).
   idleMs: process.argv.includes("--always-on") ? 0 : idleMs(),
   pollTimeoutSec: Number(process.env.TELEGRAM_HUB_POLL_TIMEOUT) || undefined,
+  // The link to the factory API; absent unless the owner set it up (docs/superpowers/specs/factory-relay-design.md).
+  ...(factory ? { factory } : {}),
   log,
   onExit: (code = 0) => process.exit(code),
 });

@@ -55,6 +55,9 @@ export const ru: Messages = {
   permissionStale: "Запрос устарел",
   permissionNotDelivered: "⚠️ Сессия не активна, ответ не доставлен",
 
+  buttonAccepted: "✅ Принято",
+  buttonRefused: "Эта кнопка уже использована или больше не действует",
+
   pollCustomHint: "Напиши ответ следующим сообщением",
   pollStale: "Опрос устарел",
   pollPickOne: "Отметь хотя бы один вариант",
